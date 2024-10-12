@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "rkbx_os2l"
-version = "0.3.1"
+version = "0.0.1"
 dependencies = [
  "mdns-sd",
  "reqwest",
