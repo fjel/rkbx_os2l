@@ -11,6 +11,12 @@ impl RekordboxOffsets {
             deck2beat: Pointer::from_string(rows.next().unwrap()),
             master_bpm: Pointer::from_string(rows.next().unwrap()),
             masterdeck_index: Pointer::from_string(rows.next().unwrap()),
+            // track_path_baseoffset: hexparse(rows.next().unwrap()),
+            deck1_track_id: Pointer::from_string(rows.next().unwrap()),
+            deck2_track_id: Pointer::from_string(rows.next().unwrap()),
+            api_bearer: Pointer::from_string(rows.next().unwrap()),
+            deck1_time: Pointer::from_string(rows.next().unwrap()),
+            deck2_time: Pointer::from_string(rows.next().unwrap()),
         }
     }
 
@@ -48,6 +54,12 @@ pub struct RekordboxOffsets {
     pub deck2beat: Pointer,
     pub master_bpm: Pointer,
     pub masterdeck_index: Pointer,
+    // pub track_path_baseoffset: Pointer,
+    pub deck1_track_id: Pointer,
+    pub deck2_track_id: Pointer,
+    pub api_bearer: Pointer,
+    pub deck1_time: Pointer,
+    pub deck2_time: Pointer,  // CHANGE
 }
 
 #[derive(Clone)]

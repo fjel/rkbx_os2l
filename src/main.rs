@@ -1,11 +1,8 @@
-use rosc::{encoder::encode, OscMessage, OscPacket, OscType};
-use rusty_link::{AblLink, SessionState};
 use std::process::Command;
 use std::{
     env,
     io::{stdout, Write},
     marker::PhantomData,
-    net::UdpSocket,
     path::Path,
     sync::mpsc::channel,
     thread::{sleep, spawn},
@@ -16,6 +13,11 @@ use winapi::um::winnt::HANDLE;
 
 mod offsets;
 use offsets::{Pointer, RekordboxOffsets};
+
+mod soundswitch;
+use soundswitch::SoundSwitchConnector;
+
+use serde_json;
 
 extern "C" {
     fn _getch() -> core::ffi::c_char;
@@ -51,6 +53,15 @@ impl<T> Value<T> {
     fn read(&self) -> T {
         read::<T>(self.handle, self.address).unwrap()
     }
+
+    fn read_bytes(&self, times: usize) -> Vec<u8> {
+        let mut byte_vec = Vec::new();
+        for _t in 0..times {
+            let read_mem_bytes = read::<u8>(self.handle, self.address + (_t)).unwrap();
+            byte_vec.push(read_mem_bytes);
+        }
+        return byte_vec;
+    }
 }
 
 pub struct Rekordbox {
@@ -61,11 +72,23 @@ pub struct Rekordbox {
     beat2_val: Value<i32>,
     masterdeck_index_val: Value<u8>,
 
+    deck1_time_val: Value<i32>,
+    deck2_time_val: Value<i32>,
+    deck1_track_id_val: Value<i32>,
+    deck2_track_id_val: Value<i32>,
+    api_bearer_val: Value<Vec<u8>>,
+
     pub beats1: i32,
     pub beats2: i32,
     pub master_beats: i32,
     pub master_bpm: f32,
     pub masterdeck_index: u8,
+    pub deck1_time: i32,
+    pub deck2_time: i32,
+    pub deck1_track_id: i32,
+    pub deck2_track_id: i32,
+    pub master_time: i32,
+    pub api_bearer: String,
 }
 
 impl Rekordbox {
@@ -78,10 +101,19 @@ impl Rekordbox {
 
         let master_bpm_val: Value<f32> = Value::new(h, base, offsets.master_bpm);
 
+        let api_bearer_val: Value<Vec<u8>> = Value::new(h, base, offsets.api_bearer);
+
         let bar1_val: Value<i32> = Value::new(h, base, offsets.deck1bar);
         let beat1_val: Value<i32> = Value::new(h, base, offsets.deck1beat);
         let bar2_val: Value<i32> = Value::new(h, base, offsets.deck2bar);
         let beat2_val: Value<i32> = Value::new(h, base, offsets.deck2beat);
+
+
+        let deck1_track_id_val: Value<i32> = Value::new(h, base, offsets.deck1_track_id);
+        let deck1_time_val: Value<i32> = Value::new(h, base, offsets.deck1_time);
+        
+        let deck2_track_id_val: Value<i32> = Value::new(h, base, offsets.deck2_track_id);
+        let deck2_time_val: Value<i32> = Value::new(h, base, offsets.deck2_time);
 
         let masterdeck_index_val: Value<u8> = Value::new(h, base, offsets.masterdeck_index);
 
@@ -92,6 +124,13 @@ impl Rekordbox {
             bar2_val,
             beat2_val,
 
+            deck1_time_val,
+            deck2_time_val,
+
+            deck1_track_id_val,
+            deck2_track_id_val,
+            api_bearer_val,
+
             masterdeck_index_val,
 
             beats1: -1,
@@ -99,6 +138,12 @@ impl Rekordbox {
             master_bpm: 120.0,
             masterdeck_index: 0,
             master_beats: 0,
+            master_time: 0,
+            deck1_track_id: 0,
+            deck2_track_id: 0,
+            deck1_time: 0,
+            deck2_time: 0,
+            api_bearer: "".to_string(),
         }
     }
 
@@ -108,10 +153,26 @@ impl Rekordbox {
         self.beats2 = self.bar2_val.read() * 4 + self.beat2_val.read();
         self.masterdeck_index = self.masterdeck_index_val.read();
 
-        self.master_beats = if self.masterdeck_index == 0 {
-            self.beats1
+        self.deck1_track_id = self.deck1_track_id_val.read();
+        self.deck2_track_id = self.deck2_track_id_val.read();
+
+        self.deck1_time = self.deck1_time_val.read();
+        self.deck2_time = self.deck2_time_val.read();
+
+        if self.masterdeck_index == 0 {
+            self.master_beats = self.beats1;
+            self.master_time = self.deck1_time;
         } else {
-            self.beats2
+            self.master_beats = self.beats2;
+            self.master_time = self.deck2_time;
+        };
+    }
+
+    pub fn update_api_bearer(&mut self) {
+        let api_bearer_vec = self.api_bearer_val.read_bytes(32);
+        self.api_bearer = match std::str::from_utf8(&api_bearer_vec) {
+            Ok(v) => v.to_string(),
+            Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
         };
     }
 }
@@ -119,11 +180,23 @@ impl Rekordbox {
 pub struct BeatKeeper {
     rb: Option<Rekordbox>,
     last_beat: i32,
+    last_time: i32,
+
+    pub api_bearer: String,
+    
+    pub last_d1track: i32,
+    pub last_d2track: i32,
+    pub last_master_track: i32,
+    pub last_master_path: String,
+    pub last_master_title: String,
+
     pub beat_fraction: f32,
     pub last_masterdeck_index: u8,
     pub offset_micros: f32,
     pub last_bpm: f32,
     pub new_beat: bool,
+    pub new_track: bool,
+    pub new_time: bool,
 }
 
 impl BeatKeeper {
@@ -131,11 +204,20 @@ impl BeatKeeper {
         BeatKeeper {
             rb: Some(Rekordbox::new(offsets)),
             last_beat: 0,
+            last_time: 0,
+            last_d1track: 0,
+            last_d2track: 0,
+            last_master_track: 0,
+            last_master_path: "".to_string(),
+            last_master_title: "".to_string(),
+            api_bearer: "".to_string(),
             beat_fraction: 1.,
             last_masterdeck_index: 0,
             offset_micros: 0.,
             last_bpm: 0.,
             new_beat: false,
+            new_track: false,
+            new_time: false,
         }
     }
 
@@ -143,23 +225,58 @@ impl BeatKeeper {
         BeatKeeper {
             rb: None,
             last_beat: 0,
+            last_time: 0,
+            last_d1track: 0,
+            last_d2track: 0,
+            last_master_track: 0,
+            last_master_path: "".to_string(),
+            last_master_title: "".to_string(),
+            api_bearer: "".to_string(),
             beat_fraction: 1.,
             last_masterdeck_index: 0,
             offset_micros: 0.,
             last_bpm: 0.,
             new_beat: false,
+            new_track: false,
+            new_time: false,
         }
     }
 
     pub fn update(&mut self, delta: Duration) {
         if let Some(rb) = &mut self.rb {
             let beats_per_micro = rb.master_bpm / 60. / 1000000.;
+            let mut master_track_changed = false;
 
             rb.update(); // Fetch values from rkbx memory
 
             if rb.masterdeck_index != self.last_masterdeck_index {
                 self.last_masterdeck_index = rb.masterdeck_index;
                 self.last_beat = rb.master_beats;
+                if rb.masterdeck_index == 0 {
+                    self.last_master_track = rb.deck1_track_id;
+                } else {
+                    self.last_master_track = rb.deck2_track_id;
+                }
+                master_track_changed = true;
+            }
+
+            if rb.deck1_track_id != self.last_d1track  {
+                println!("Deck 1 track change: {}", rb.deck1_track_id);
+                self.last_d1track = rb.deck1_track_id;
+                if rb.masterdeck_index == 0 {
+                    self.last_master_track = rb.deck1_track_id;
+                    master_track_changed = true;
+
+                }
+            }
+
+            if rb.deck2_track_id != self.last_d2track  {
+                println!("Deck 2 track change: {}", rb.deck2_track_id);
+                self.last_d2track = rb.deck2_track_id;
+                if rb.masterdeck_index == 1 {
+                    self.last_master_track = rb.deck2_track_id;
+                    master_track_changed = true;
+                }
             }
 
             if (rb.master_beats - self.last_beat).abs() > 0 {
@@ -167,12 +284,39 @@ impl BeatKeeper {
                 self.beat_fraction = 0.;
                 self.new_beat = true;
             }
+
+            if rb.master_time != self.last_time {
+                self.last_time = rb.master_time;
+                self.new_time = true;
+            }
+            
+            if master_track_changed {
+                if self.last_master_track > 0 {
+                    let res = new_master_track(self.last_master_track, &self.api_bearer);
+                    if res["code"] != 404 {
+                        self.last_master_path = res["item"]["FolderPath"].as_str().unwrap().to_string();
+                        self.last_master_title = res["item"]["FileNameL"].as_str().unwrap().to_string();
+                        self.new_track = true;
+                    }
+                }
+            }
+
             self.beat_fraction =
                 (self.beat_fraction + delta.as_micros() as f32 * beats_per_micro) % 1.;
         } else {
             self.beat_fraction = (self.beat_fraction + delta.as_secs_f32() * 130. / 60.) % 1.;
         }
     }
+
+    pub fn update_api_bearer(&mut self) {
+        if let Some(rb) = &mut self.rb {
+
+            rb.update_api_bearer(); // Fetch values from rkbx memory
+            self.api_bearer = rb.api_bearer.clone();
+
+        }
+    }
+
     pub fn get_beat_faction(&mut self) -> f32 {
         (self.beat_fraction
             + if let Some(rb) = &self.rb {
@@ -203,12 +347,44 @@ impl BeatKeeper {
         false
     }
 
+    pub fn get_new_time(&mut self) -> bool {
+        if self.new_time {
+            self.new_time = false;
+            return true;
+        }
+        false
+    }
+
+    pub fn get_new_master_track(&mut self) -> bool {
+        if self.new_track {
+            self.new_track = false;
+            return true;
+        }
+        false
+    }
+
     pub fn change_beat_offset(&mut self, offset: f32) {
         self.offset_micros += offset;
     }
 }
 
 const CHARS: [&str; 4] = ["|", "/", "-", "\\"];
+
+pub fn new_master_track(track_id: i32, api_key: &String) -> serde_json::Value {
+    let client = reqwest::blocking::Client::new();
+
+    let response = client
+    .get(format!("http://127.0.0.1:30001/api/v1/data/djmdContents/{}/", track_id))
+    .header("User-Agent", "rekordbox/6.8.4.0001 Windows 11(64bit)")
+    .header("Accept", "*/*")
+    .header("Authorization", format!("Bearer {}", api_key))
+    .send().expect("failed to get response").text().expect("failed to get payload");
+
+    let res: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+    return res;
+
+}
 
 fn main() {
     if !Path::new("./offsets").exists() {
@@ -223,16 +399,12 @@ fn main() {
 
     let args: Vec<String> = env::args().collect();
 
-    let mut source_address = "0.0.0.0:0".to_string();
-    let mut target_address = "127.0.0.1:6669".to_string();
-
-    let mut osc_enabled = false;
-
     let version_offsets = RekordboxOffsets::from_file("offsets");
     let mut versions: Vec<String> = version_offsets.keys().map(|x| x.to_string()).collect();
     versions.sort();
     versions.reverse();
     let mut target_version = versions[0].clone();
+    let mut poll_rate: u64 = 60;
 
     let mut args_iter = args.iter();
     args_iter.next();
@@ -247,22 +419,25 @@ fn main() {
                             download_offsets();
                             return;
                         }
-                        "o" => {
-                            osc_enabled = true;
-                        }
-                        "s" => {
-                            source_address = args_iter.next().unwrap().to_string();
-                        }
-                        "t" => {
-                            target_address = args_iter.next().unwrap().to_string();
+                        "p" => {
+                            if let Some(poll_arg) = args_iter.next() {
+                                match poll_arg.parse::<u64>() {
+                                    Ok(value) => {
+                                        poll_rate = value; // Update poll_rate if parsing is successful
+                                    }
+                                    Err(_) => {
+                                        println!("Invalid input for poll_rate. Using default value: {}", poll_rate);
+                                    }
+                                }
+                            }
                         }
                         "v" => {
                             target_version = args_iter.next().unwrap().to_string();
                         }
                         "h" => {
                             println!(
-                                " - Rekordbox OSC v{} -
-A tool for sending Rekordbox timing data to visualizers using OSC
+                                " - Rekordbox OS2L v{} -
+A tool for sending Rekordbox track name, time and bpm to soundswitch (based on virtualdj communication)
 
 Flags:
 
@@ -270,12 +445,10 @@ Flags:
  -u  Fetch latest offset list from GitHub and exit
  -v  Rekordbox version to target, eg. 6.7.3
 
--- OSC --
- -o  Enable OSC
- -s  Source address, eg. 127.0.0.1:1337
- -t  Target address, eg. 192.168.1.56:6667
+ -p  Change poll value
 
-Use i/k to change the beat offset by +/- 1ms
+Use r to resend master path/track to soundswitch.
+Use y to reset and resend master path/track to soundswitch (useful for changing to Autoloop override during a song).
 
 Current default version: {}
 Available versions:",
@@ -308,48 +481,21 @@ Available versions:",
     };
     println!("Targeting Rekordbox version {target_version}");
 
-    let socket = if osc_enabled {
-        println!("Connecting from: {}", source_address);
-        println!("Connecting to:   {}", target_address);
-        let socket = match UdpSocket::bind(&source_address) {
-            Ok(socket) => socket,
-            Err(e) => {
-                println!("Failed to bind to address {source_address}. Error:\n{}", e);
-                return;
-            }
-        };
-        match socket.connect(&target_address) {
-            Ok(_) => (),
-            Err(e) => {
-                println!(
-                    "Failed to open socket to address {target_address}. Error:\n{}",
-                    e
-                );
-                return;
-            }
-        };
-        Some(socket)
-    } else {
-        None
-    };
-
     println!();
     println!(
-        "Press i/k to change offset in milliseconds. c to quit. -h flag for help and version info."
+        "Press r to resend master path. y to reset master path. c to quit. -h flag for help and version info."
     );
     println!();
 
     let mut keeper = BeatKeeper::new(offsets.clone());
-    let link = AblLink::new(120.);
-    link.enable(false);
 
-    let mut state = SessionState::new();
-    link.capture_app_session_state(&mut state);
-    link.enable(true);
+    let connection = SoundSwitchConnector::discover_soundswitch();
+    let mut os2l_stream = SoundSwitchConnector::initial_connect(connection);
+    
 
     // Due to Windows timers having a default resolution 0f 15.6ms, we need to use a "too high"
     // value to acheive ~60Hz
-    let period = Duration::from_micros(1000000 / 120);
+    let period = Duration::from_micros(1000000 / poll_rate);
 
     let mut last_instant = Instant::now();
 
@@ -358,6 +504,12 @@ Available versions:",
 
     let mut stdout = stdout();
 
+    let mut first_send = false;
+
+    // Get API bearer key
+    keeper.update_api_bearer();
+    println!("API key: {}",keeper.api_bearer);
+
     println!("Entering loop");
     loop {
         let delta = Instant::now() - last_instant; // Is this timer accurate enough?
@@ -365,40 +517,28 @@ Available versions:",
 
         keeper.update(delta); // Get values, advance time
 
-        let bfrac = keeper.get_beat_faction();
-
-        if let Some(socket) = &socket {
-            let msg = OscPacket::Message(OscMessage {
-                addr: "/beat".to_string(),
-                args: vec![OscType::Float(bfrac)],
-            });
-            let packet = encode(&msg).unwrap();
-            socket.send(&packet[..]).unwrap();
-        }
-
-        if let Some(bpm) = keeper.get_bpm_changed() {
-            state.set_tempo(bpm.into(), link.clock_micros());
-            link.commit_app_session_state(&state);
-
-            if let Some(socket) = &socket {
-                let msg = OscPacket::Message(OscMessage {
-                    addr: "/bpm".to_string(),
-                    args: vec![OscType::Float(bpm)],
-                });
-                let packet = encode(&msg).unwrap();
-                socket.send(&packet[..]).unwrap();
-            }
-        }
 
         if keeper.get_new_beat() {
-            let current_link_beat_approx = state.beat_at_time(link.clock_micros(), 4.).round();
-            let target_beat = ((keeper.last_beat as f64) % 4. - current_link_beat_approx % 4. + 4.)
-                % 4.
-                + current_link_beat_approx
-                - 1.; // Ensure the 1 is on the 1
+            SoundSwitchConnector::send_beatpos(&mut os2l_stream, keeper.last_beat);
 
-            state.request_beat_at_time(target_beat, link.clock_micros(), 4.);
-            link.commit_app_session_state(&state);
+            if keeper.last_beat % 4 == 1 {
+                SoundSwitchConnector::send_beat(&mut os2l_stream, keeper.last_beat, keeper.last_bpm);
+            }
+
+            if keeper.get_new_master_track() {
+                println!("Path: {:?}", keeper.last_master_path);
+                println!("Title: {:?}", keeper.last_master_title);
+                SoundSwitchConnector::send_track(&mut os2l_stream, &mut keeper.last_master_path);
+            }
+
+        }
+
+        if keeper.get_new_time() {
+            if first_send == false {
+                first_send = true;
+            } else {
+                SoundSwitchConnector::send_time(&mut os2l_stream, keeper.last_time);
+            }
         }
 
         while let Ok(key) = rx.try_recv() {
@@ -407,11 +547,18 @@ Available versions:",
                     //"c"
                     return;
                 }
-                105 => {
-                    keeper.change_beat_offset(1000.);
+                114 => {
+                    //"r"
+                    println!("Path: {:?}", keeper.last_master_path);
+                    println!("Title: {:?}", keeper.last_master_title);
+                    SoundSwitchConnector::send_track(&mut os2l_stream, &mut keeper.last_master_path);
                 }
-                107 => {
-                    keeper.change_beat_offset(-1000.);
+                121 => {
+                    //"y"
+                    println!("Resetting playing track");
+                    SoundSwitchConnector::send_track(&mut os2l_stream, &mut "".to_string());
+                    sleep(Duration::from_millis(50));
+                    SoundSwitchConnector::send_track(&mut os2l_stream, &mut keeper.last_master_path);
                 }
                 _ => (),
             }
@@ -420,27 +567,18 @@ Available versions:",
         if count % 20 == 0 {
             step = (step + 1) % 4;
 
-            let frac = (keeper.last_beat - 1) % 4;
-
             print!(
-                "\rRunning {} [{}] Deck {}     OSC Offset: {}ms     Frq: {: >3}Hz    Peers:{}   BPM:{}    ",
+                "\rRunning {} [{:02}:{:02}]  Deck {}  Frq: {: >3}Hz  ",
                 CHARS[step],
-                (0..4)
-                .map(|i| {
-                    if i == frac {
-                        "."
-                    } else {
-                        " "
-                    }
-                })
-                .collect::<String>(),
+                (keeper.last_time/1000) / 60,
+                (keeper.last_time/1000) % 60,
                 keeper.last_masterdeck_index,
-                keeper.offset_micros / 1000.,
                 1000000 / (delta.as_micros().max(1)),
-                link.num_peers(),
-                keeper.last_bpm
                 );
-
+            print!(
+                "Master title: {}",
+                keeper.last_master_title
+            );
             stdout.flush().unwrap();
         }
         count = (count + 1) % 120;
@@ -454,7 +592,7 @@ fn download_offsets() {
         .args([
             "-o",
             "offsets",
-            "https://raw.githubusercontent.com/grufkork/rkbx_osc/master/offsets",
+            "https://raw.githubusercontent.com/fjel/rkbx_os2l/master/offsets",
         ])
         .output()
     {

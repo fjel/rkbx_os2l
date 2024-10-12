@@ -1,50 +1,57 @@
-# Rekordbox OSC
-Ableton Link & OSC support for Rekordbox, to connect to visualisers and music software
+# Rekordbox SoundSwitch (os2l)
+Open Sound to Light (os2l) protocol support for Rekordbox.
+When run on the same computer as an instance of Rekordbox and SoundSwitch, it will read information from Rekordbox and send to SoundSwitch.
 
-## What does it do?
-When run on the same computer as an instance of Rekordbox, it will read the current timing information and send this over your protocol of choice. By default it outputs a 4-beat aligned signal using Ableton Link, but it can also transmit equivalent data over OSC, although with less accurate timing. 
+## Features
+- Automatically discover SoundSwitch on the local machine.
+- Autoloops with beat syncing
+- Full autoscript support when using VirtualDJ to prepare the tracks.
+- Reads values from rekordbox memory, does not crash or interfere with rekordbox
 
-The program does not interact with the audio stream in any way, but reads the onscreen text values through memory. Thus your beatgrid must be correct for it to work as expected. 
 
-## Why?
-Rekordbox's Ableton Link integration only allows for receiving a signal, not extracting it.
+## Setup
+Open SoundSwitch and then go to preferences (cog in upper right corner).  
+Under "Input" select "VirtualDJ", and "Auto connect". Restart SoundSwitch.  
+I have only tested SoundSwitch and Rekordbox on the same machine, but it might work between computers on the same network.  
 
 ## Usage
-`rkbx_osc.exe [flags]`
+Start Rekordbox and SoundSwitch, and then start rkbx_os2l.exe with your specific rekordbox version.
+`rkbx_os2l.exe [flags]`
 where
 ``` 
  -h  Print help and available versions
  -u  Fetch latest offset list from GitHub and exit
- -v  Rekordbox version to target, eg. 6.7.3
+ -v  Rekordbox version to target, eg. 6.8.4
 
--- OSC --
- -o  Enable OSC
- -s  Source address, eg. 127.0.0.1:1337
- -t  Target address, eg. 192.168.1.56:6667
+ -p  Change poll value
+
 ```
-If no arguments are given, it defaults to the latest supported rekordbox version and Ableton Link. If OSC is enabled, it will send to 127.0.0.1:6669. As messages are sent with UDP, source address should not need to be set.
+If no arguments are given, it defaults to the latest supported rekordbox version.
 
-## OSC Addresses
- - `/beat`: the current beat fraction, as a float counting from 0 to 1
- - `/bpm`: the master deck tempo in BPM
+
+### Autoscript
+To have autoscript support you need to have VirtualDJ (free version) on your computer to get a proper beatgrid.
+Note: The path to the song is what SoundSwitch uses to find the scripted track, so make sure that the VirtualDJ path to the song is the same as the path to the song you use in Rekordbox.
+1. Open up VirtualDJ, and find your music in the file browser
+2. Right click folder or files and go to "Batch"->"Analyze for BPM etc". This might take a while depending on your computer
+3. When VirtualDJ is finished analyzing, go to "Edit" mode in SoundSwitch. Select "Virtual DJ Tracks" in the "Music" menu.
+4. Go to a song and select "Automation"->"Autoscript". You can also select multiple tracks, rightclick and "Autoscript selected tracks"
+When you go back to performance mode, the lightshow should now be activated when you play the songs from rekordbox (on master).
 
 ## Supported versions
-~~Any version not listed will 99% not work, but you can always try using an adjacent version.~~
-As of 7.0.1 the offsets do not seem to change. I hope it continues this way.
-
+I have not started on finding values for version 7 yet.  
+Hopefully as stated in https://github.com/grufkork/rkbx_osc i will only need to do this once for version 7.
 | Rekordbox Version  |
 | ----- |
-| 7.0.1, 7.0.0 |
-| 6.8.5, 6.8.4, 6.8.3, 6.8.2, 6.7.7, 6.7.4, 6.7.3 |
+| 6.8.5 |
+| 6.8.4 |
 
 ## How it works
-The timing information is extracted through reading Rekordbox's memory. The program reads the current beat and measure from the text display on top of the large waveform, and detects when these change.
-When a change occurs, the beat fraction is set to 0 and then counts linearly upwards at a pace dictated by the master track BPM.
+By looking at the communication between VirtualDJ and SoundSwitch i was able to find what values were required to have proper autoloop and scripted track support. These values are extracted by reading Rekordbox's memory, and is sent to SoundSwitch using os2l protocol.
 
 ## Limitations
 - Only supports two decks.
-- Might register an extra beat when switching master deck.
-- Assumes 4/4 time signature - Rekordbox does not support anything else without manually editing the database
+- Only sends data for master deck
 - Windows only
 
 # Technical Details
@@ -54,13 +61,18 @@ The `offsets` file contain the hex memory addresses (without the leading 0x) for
 
 Example entry with explanations:
 ```
-7.0.0                   Rerkordbox Version
+6.8.5                   Rerkordbox Version
 052EA410 28 0 48 2468   Deck 1 Bar
 052EA410 28 0 48 246C   Deck 1 Beat
 052EA410 28 0 50 2468   Deck 2 Bar
 052EA410 28 0 50 246C   Deck 2 Beat
 0544A460 28 180 0 140   Masterdeck BPM
 052413A8 20 278 124     Masterdeck index
+0442C0F8 1FC            track_id deck1
+0442C0F8 200            track_id deck2
+04436DB0 0              bearer
+0443F5D0 120 1AC        time deck 1
+0443F5D0 128 1AC        time deck 2
 ```
 
 ## Updating
@@ -82,5 +94,11 @@ This one is usually the trickiest. There are a couple of other values wich corre
 ### `deck1, deck2, bar, beat`
 On the waveform view, these are the values "xx.x" showing the current bar and beat. The second to last value in the offset chain is the same per deck, and the last is the same per beat/bar. Thus, if you find Deck1 Bar and Deck2 Beat, you can calculate Deck1 Beat and Deck2 Bar.
 
-## Notes on timing
-Windows, by default, only has sleeps in increments of ~16ms. As such, the the sending frequency is a bit uneven. The rate is set to 120Hz in the code, but that results in about 60Hz update rate. I'm not sure if the method measuring the delta time is accurate enough, or 
+### `track_id for deck1 and deck2`
+This is the values of track loaded in deck1 and deck2. The values correspond to rekordbox database ids
+
+### `time for deck1 and deck2`
+The current timestamp of deck1 and deck2
+
+### `bearer`
+This is the token rekordbox uses to communicate with the rekordbox database daemon, reset on every startup. We need this to get the local path of tracks from their id
