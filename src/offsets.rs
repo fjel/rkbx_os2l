@@ -41,6 +41,12 @@ impl RekordboxOffsets {
             }
         }
 
+        // Handle the last entry if the file doesn't end with a blank line
+        if !lines.is_empty() {
+            let o = RekordboxOffsets::from_lines(&lines);
+            map.insert(o.rbversion.clone(), o);
+        }
+
         map
     }
 }
