@@ -34,49 +34,54 @@ struct Value<T> {
 }
 
 impl<T> Value<T> {
-    fn new(h: HANDLE, base: usize, offsets: Pointer) -> Value<T> {
+    fn new(h: HANDLE, base: usize, offsets: Pointer) -> Option<Value<T>> {
         let mut address = base;
 
         for offset in offsets.offsets {
-            address = read::<usize>(h, address + offset)
-                .expect("Memory read failed, check your Rekordbox version!");
+            address = match read::<usize>(h, address + offset) {
+                Ok(addr) => addr,
+                Err(_) => return None, // Return None if memory read fails
+            };
         }
         address += offsets.final_offset;
 
-        Value::<T> {
+        Some(Value::<T> {
             address,
             handle: h,
             _marker: PhantomData::<T>,
-        }
+        })
     }
 
-    fn read(&self) -> T {
-        read::<T>(self.handle, self.address).unwrap()
+    fn read(&self) -> Option<T> {
+        read::<T>(self.handle, self.address).ok()
     }
 
-    fn read_bytes(&self, times: usize) -> Vec<u8> {
+    fn read_bytes(&self, times: usize) -> Option<Vec<u8>> {
         let mut byte_vec = Vec::new();
         for _t in 0..times {
-            let read_mem_bytes = read::<u8>(self.handle, self.address + (_t)).unwrap();
+            let read_mem_bytes = read::<u8>(self.handle, self.address + (_t)).ok()?;
             byte_vec.push(read_mem_bytes);
         }
-        return byte_vec;
+        Some(byte_vec)
     }
 }
 
 pub struct Rekordbox {
-    master_bpm_val: Value<f32>,
-    bar1_val: Value<i32>,
-    beat1_val: Value<i32>,
-    bar2_val: Value<i32>,
-    beat2_val: Value<i32>,
-    masterdeck_index_val: Value<u8>,
+    handle: HANDLE,
+    base: usize,
+    offsets: RekordboxOffsets,
+    master_bpm_val: Option<Value<f32>>,
+    bar1_val: Option<Value<i32>>,
+    beat1_val: Option<Value<i32>>,
+    bar2_val: Option<Value<i32>>,
+    beat2_val: Option<Value<i32>>,
+    masterdeck_index_val: Option<Value<u8>>,
 
-    deck1_time_val: Value<i32>,
-    deck2_time_val: Value<i32>,
-    deck1_track_id_val: Value<i32>,
-    deck2_track_id_val: Value<i32>,
-    api_bearer_val: Value<Vec<u8>>,
+    deck1_time_val: Option<Value<i32>>,
+    deck2_time_val: Option<Value<i32>>,
+    deck1_track_id_val: Option<Value<i32>>,
+    deck2_track_id_val: Option<Value<i32>>,
+    api_bearer_val: Option<Value<Vec<u8>>>,
 
     pub beats1: i32,
     pub beats2: i32,
@@ -99,25 +104,22 @@ impl Rekordbox {
 
         let base = rb.get_module_base("rekordbox.exe").unwrap();
 
-        let master_bpm_val: Value<f32> = Value::new(h, base, offsets.master_bpm);
-
-        let api_bearer_val: Value<Vec<u8>> = Value::new(h, base, offsets.api_bearer);
-
-        let bar1_val: Value<i32> = Value::new(h, base, offsets.deck1bar);
-        let beat1_val: Value<i32> = Value::new(h, base, offsets.deck1beat);
-        let bar2_val: Value<i32> = Value::new(h, base, offsets.deck2bar);
-        let beat2_val: Value<i32> = Value::new(h, base, offsets.deck2beat);
-
-
-        let deck1_track_id_val: Value<i32> = Value::new(h, base, offsets.deck1_track_id);
-        let deck1_time_val: Value<i32> = Value::new(h, base, offsets.deck1_time);
-        
-        let deck2_track_id_val: Value<i32> = Value::new(h, base, offsets.deck2_track_id);
-        let deck2_time_val: Value<i32> = Value::new(h, base, offsets.deck2_time);
-
-        let masterdeck_index_val: Value<u8> = Value::new(h, base, offsets.masterdeck_index);
+        let master_bpm_val = Value::new(h, base, offsets.master_bpm.clone());
+        let api_bearer_val = Value::new(h, base, offsets.api_bearer.clone());
+        let bar1_val = Value::new(h, base, offsets.deck1bar.clone());
+        let beat1_val = Value::new(h, base, offsets.deck1beat.clone());
+        let bar2_val = Value::new(h, base, offsets.deck2bar.clone());
+        let beat2_val = Value::new(h, base, offsets.deck2beat.clone());
+        let deck1_track_id_val = Value::new(h, base, offsets.deck1_track_id.clone());
+        let deck1_time_val = Value::new(h, base, offsets.deck1_time.clone());
+        let deck2_track_id_val = Value::new(h, base, offsets.deck2_track_id.clone());
+        let deck2_time_val = Value::new(h, base, offsets.deck2_time.clone());
+        let masterdeck_index_val = Value::new(h, base, offsets.masterdeck_index.clone());
 
         Self {
+            handle: h,
+            base,
+            offsets,
             master_bpm_val,
             bar1_val,
             beat1_val,
@@ -136,7 +138,7 @@ impl Rekordbox {
             beats1: -1,
             beats2: -1,
             master_bpm: 120.0,
-            masterdeck_index: 0,
+            masterdeck_index: 255,
             master_beats: 0,
             master_time: 0,
             deck1_track_id: 0,
@@ -148,32 +150,82 @@ impl Rekordbox {
     }
 
     fn update(&mut self) {
-        self.master_bpm = self.master_bpm_val.read();
-        self.beats1 = self.bar1_val.read() * 4 + self.beat1_val.read();
-        self.beats2 = self.bar2_val.read() * 4 + self.beat2_val.read();
-        self.masterdeck_index = self.masterdeck_index_val.read();
+        // Retry initializing failed values
+        if self.master_bpm_val.is_none() {
+            self.master_bpm_val = Value::new(self.handle, self.base, self.offsets.master_bpm.clone());
+        }
+        if self.bar1_val.is_none() {
+            self.bar1_val = Value::new(self.handle, self.base, self.offsets.deck1bar.clone());
+        }
+        if self.beat1_val.is_none() {
+            self.beat1_val = Value::new(self.handle, self.base, self.offsets.deck1beat.clone());
+        }
+        if self.bar2_val.is_none() {
+            self.bar2_val = Value::new(self.handle, self.base, self.offsets.deck2bar.clone());
+        }
+        if self.beat2_val.is_none() {
+            self.beat2_val = Value::new(self.handle, self.base, self.offsets.deck2beat.clone());
+        }
+        if self.masterdeck_index_val.is_none() {
+            self.masterdeck_index_val = Value::new(self.handle, self.base, self.offsets.masterdeck_index.clone());
+        }
+        if self.deck1_track_id_val.is_none() {
+            self.deck1_track_id_val = Value::new(self.handle, self.base, self.offsets.deck1_track_id.clone());
+        }
+        if self.deck2_track_id_val.is_none() {
+            self.deck2_track_id_val = Value::new(self.handle, self.base, self.offsets.deck2_track_id.clone());
+        }
+        if self.deck1_time_val.is_none() {
+            self.deck1_time_val = Value::new(self.handle, self.base, self.offsets.deck1_time.clone());
+        }
+        if self.deck2_time_val.is_none() {
+            self.deck2_time_val = Value::new(self.handle, self.base, self.offsets.deck2_time.clone());
+        }
 
-        self.deck1_track_id = self.deck1_track_id_val.read();
-        self.deck2_track_id = self.deck2_track_id_val.read();
+        // Read values, using defaults if not available yet
+        self.master_bpm = self.master_bpm_val.as_ref().and_then(|v| v.read()).unwrap_or(120.0);
+        
+        if let (Some(bar1), Some(beat1)) = (&self.bar1_val, &self.beat1_val) {
+            if let (Some(b1), Some(bt1)) = (bar1.read(), beat1.read()) {
+                self.beats1 = b1 * 4 + bt1;
+            }
+        }
+        if let (Some(bar2), Some(beat2)) = (&self.bar2_val, &self.beat2_val) {
+            if let (Some(b2), Some(bt2)) = (bar2.read(), beat2.read()) {
+                self.beats2 = b2 * 4 + bt2;
+            }
+        }
+        
+        self.masterdeck_index = self.masterdeck_index_val.as_ref().and_then(|v| v.read()).unwrap_or(255);
+        self.deck1_track_id = self.deck1_track_id_val.as_ref().and_then(|v| v.read()).unwrap_or(0);
+        self.deck2_track_id = self.deck2_track_id_val.as_ref().and_then(|v| v.read()).unwrap_or(0);
+        self.deck1_time = self.deck1_time_val.as_ref().and_then(|v| v.read()).unwrap_or(0);
+        self.deck2_time = self.deck2_time_val.as_ref().and_then(|v| v.read()).unwrap_or(0);
 
-        self.deck1_time = self.deck1_time_val.read();
-        self.deck2_time = self.deck2_time_val.read();
-
+        // Only update master info if masterdeck_index is valid (0 or 1)
         if self.masterdeck_index == 0 {
             self.master_beats = self.beats1;
             self.master_time = self.deck1_time;
-        } else {
+        } else if self.masterdeck_index == 1 {
             self.master_beats = self.beats2;
             self.master_time = self.deck2_time;
-        };
+        }
     }
 
     pub fn update_api_bearer(&mut self) {
-        let api_bearer_vec = self.api_bearer_val.read_bytes(32);
-        self.api_bearer = match std::str::from_utf8(&api_bearer_vec) {
-            Ok(v) => v.to_string(),
-            Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
-        };
+        // Retry initializing if not available
+        if self.api_bearer_val.is_none() {
+            self.api_bearer_val = Value::new(self.handle, self.base, self.offsets.api_bearer.clone());
+        }
+        
+        if let Some(ref api_val) = self.api_bearer_val {
+            if let Some(api_bearer_vec) = api_val.read_bytes(32) {
+                self.api_bearer = match std::str::from_utf8(&api_bearer_vec) {
+                    Ok(v) => v.to_string(),
+                    Err(_) => String::new(),
+                };
+            }
+        }
     }
 }
 
@@ -249,7 +301,8 @@ impl BeatKeeper {
 
             rb.update(); // Fetch values from rkbx memory
 
-            if rb.masterdeck_index != self.last_masterdeck_index {
+            // Only process masterdeck_index if it's valid (0 or 1, not 255)
+            if rb.masterdeck_index != self.last_masterdeck_index && rb.masterdeck_index <= 1 {
                 self.last_masterdeck_index = rb.masterdeck_index;
                 self.last_beat = rb.master_beats;
                 if rb.masterdeck_index == 0 {
@@ -260,7 +313,7 @@ impl BeatKeeper {
                 master_track_changed = true;
             }
 
-            if rb.deck1_track_id != self.last_d1track  {
+            if rb.deck1_track_id != self.last_d1track && rb.deck1_track_id > 0 {
                 println!("Deck 1 track change: {}", rb.deck1_track_id);
                 self.last_d1track = rb.deck1_track_id;
                 if rb.masterdeck_index == 0 {
@@ -270,7 +323,7 @@ impl BeatKeeper {
                 }
             }
 
-            if rb.deck2_track_id != self.last_d2track  {
+            if rb.deck2_track_id != self.last_d2track && rb.deck2_track_id > 0 {
                 println!("Deck 2 track change: {}", rb.deck2_track_id);
                 self.last_d2track = rb.deck2_track_id;
                 if rb.masterdeck_index == 1 {
