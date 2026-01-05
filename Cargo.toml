@@ -11,9 +11,9 @@ repository = "https://github.com/fjel/rkbx_os2l"
 name = "rkbx_os2l"
 path = "src/main.rs"
 
-[[bin]]
-name = "offset_helper"
-path = "src/bin/offset_helper.rs"
+#[[bin]]
+#name = "offset_helper"
+#path = "src/bin/offset_helper.rs"
 
 [dependencies]
 toy-arms = {version = "0.9.4", features = ["external"]}
