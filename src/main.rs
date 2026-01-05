@@ -558,6 +558,8 @@ Available versions:",
     let mut stdout = stdout();
 
     let mut first_send = false;
+    
+    let mut track_switch_count = 0;
 
     // Get API bearer key
     keeper.update_api_bearer();
@@ -581,6 +583,12 @@ Available versions:",
             if keeper.get_new_master_track() {
                 println!("Path: {:?}", keeper.last_master_path);
                 println!("Title: {:?}", keeper.last_master_title);
+                track_switch_count += 1;
+                if track_switch_count >= 10 {
+                    SoundSwitchConnector::send_track(&mut os2l_stream, &mut "".to_string());
+                    sleep(Duration::from_millis(20));
+                    track_switch_count = 0;
+                }
                 SoundSwitchConnector::send_track(&mut os2l_stream, &mut keeper.last_master_path);
             }
 
