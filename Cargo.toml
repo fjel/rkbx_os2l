@@ -11,6 +11,10 @@ repository = "https://github.com/fjel/rkbx_os2l"
 name = "rkbx_os2l"
 path = "src/main.rs"
 
+[[bin]]
+name = "offset_helper"
+path = "src/bin/offset_helper.rs"
+
 [dependencies]
 toy-arms = {version = "0.9.4", features = ["external"]}
 winapi = "0.3.9"
@@ -18,5 +22,5 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 serde_json = "1.0"
 mdns-sd = "0.11"
 
-[target.'cfg(windows)'.dependencies] 0402
+[target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.5", features = ["winnt"] }
