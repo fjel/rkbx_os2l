@@ -39,10 +39,9 @@ Note: The path to the song is what SoundSwitch uses to find the scripted track, 
 When you go back to performance mode, the lightshow should now be activated when you play the songs from rekordbox (on master).
 
 ## Supported versions
-I have not started on finding values for version 7 yet.  
-Hopefully as stated in https://github.com/grufkork/rkbx_osc i will only need to do this once for version 7.
 | Rekordbox Version  |
 | ----- |
+| 7.2.8 |
 | 6.8.5 |
 | 6.8.4 |
 
