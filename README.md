@@ -7,6 +7,8 @@ When run on the same computer as an instance of Rekordbox and SoundSwitch, it wi
 - Autoloops with beat syncing
 - Full autoscript support when using VirtualDJ to prepare the tracks.
 - Reads values from rekordbox memory, does not crash or interfere with rekordbox
+- Sends the master track, BPM and beats to a DJ Visuals server over UDP (on by default, see below)
+- SoundSwitch discovery and reconnects run in the background, so a missing SoundSwitch never stalls the visuals
 
 
 ## Setup
@@ -25,8 +27,31 @@ where
 
  -p  Change poll value
 
+ -t  DJ Visuals target, host[:port] (port defaults to 9099), or off. Default: 127.0.0.1:9099
+ -n  Run without SoundSwitch (no discovery/connect), eg. to only feed DJ Visuals
+
 ```
-If no arguments are given, it defaults to the latest supported rekordbox version.
+If no arguments are given, it defaults to the latest supported rekordbox version, sends to SoundSwitch and to DJ Visuals on 127.0.0.1:9099.
+
+Examples:
+```
+rkbx_os2l.exe -t 192.168.1.50          SoundSwitch + visuals on a laptop on the LAN
+rkbx_os2l.exe -n -t 192.168.1.50:9100  Only the visuals, no SoundSwitch
+rkbx_os2l.exe -t off                   Only SoundSwitch
+```
+
+### DJ Visuals
+Alongside SoundSwitch, rkbx_os2l sends what's playing to a DJ Visuals server: UDP, one JSON object per datagram. It's fire-and-forget, so a missing or slow visuals server never affects SoundSwitch or the polling loop.
+
+| Message | Sent when |
+| ----- | ----- |
+| `{"type":"track","file":"C:\\Music\\x.mp3","title":"...","artist":"...","bpm":128.0,"deck":1}` | The master deck changes, or the master deck's track changes (once its path is known). Resent every 5 s so a restarted visuals server picks it up. Tracks loaded on the other deck are not sent. |
+| `{"type":"bpm","bpm":128.0}` | Master BPM changes by at least 0.005 (max ~10/s, only 40–300) |
+| `{"type":"beat","beat":1}` | Every beat of the master deck while it's playing. `beat` is the position in the bar, 1–4 (1 = downbeat) |
+
+`title` is the Rekordbox title, or the file name if there is none. `artist` is empty unless Rekordbox's API returns an artist name. The first track lookup is saved to `djmd_track_sample.json` so you can see which fields it returns.
+
+The visuals can run on another machine: point `-t` at its LAN address (or name). Make sure UDP 9099 is open in that machine's firewall. `r` also resends the master track to the visuals. The status line shows `ss on/wait/off` for SoundSwitch and the visuals target.
 
 
 ### Autoscript

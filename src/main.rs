@@ -4,7 +4,10 @@ use std::{
     io::{stdout, Write},
     marker::PhantomData,
     path::Path,
-    sync::mpsc::channel,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::channel,
+    },
     thread::{sleep, spawn},
     time::{Duration, Instant},
 };
@@ -15,12 +18,18 @@ mod offsets;
 use offsets::{Pointer, RekordboxOffsets};
 
 mod soundswitch;
-use soundswitch::{Os2l, DECKS};
+use soundswitch::{SoundSwitch, DECKS};
+
+mod visuals;
+use visuals::{beat_in_bar, parse_target, Visuals};
 
 use serde_json;
 
 /// A deck counts as playing while its time keeps changing; this long without a change means stopped.
 const PLAY_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// The first djmdContents response is saved here, to check which metadata fields Rekordbox returns.
+const TRACK_JSON_LOG: &str = "djmd_track_sample.json";
 
 extern "C" {
     fn _getch() -> core::ffi::c_char;
@@ -190,18 +199,30 @@ impl Rekordbox {
     }
 }
 
-/// Per-deck state, ready to be sent to SoundSwitch.
+/// Per-deck state, ready to be sent to SoundSwitch and the visuals.
 #[derive(Default)]
 pub struct Deck {
+    /// Track whose path/title/artist below have been resolved through the API
     pub track_id: i32,
+    /// Track currently loaded according to Rekordbox memory (may still be waiting for the API)
+    pub loaded_id: i32,
     pub path: String,
+    /// Track title from Rekordbox, or the file name if it has none
     pub title: String,
+    pub artist: String,
     pub time: i32,
     pub beats: i32,
     pub playing: bool,
     pub level: f32,
     last_time_change: Option<Instant>,
     retry_track_at: Option<Instant>,
+}
+
+impl Deck {
+    /// The path/title/artist belong to the track that is loaded right now.
+    pub fn track_resolved(&self) -> bool {
+        self.track_id > 0 && self.track_id == self.loaded_id && !self.path.is_empty()
+    }
 }
 
 pub struct BeatKeeper {
@@ -257,14 +278,20 @@ impl BeatKeeper {
             let deck = &mut self.decks[i];
 
             let id = self.rb.track_id[i];
+            deck.loaded_id = id;
             if id > 0 && id != deck.track_id && deck.retry_track_at.map_or(true, |t| now >= t) {
                 match fetch_track(id, &self.api_bearer) {
-                    Some((path, title)) => {
-                        println!("\nDeck {} track change: {} ({})", i + 1, title, id);
+                    Some(track) => {
                         deck.track_id = id;
-                        deck.path = path;
-                        deck.title = title;
+                        deck.path = track.path;
+                        deck.title = track.title.unwrap_or(track.file_name);
+                        deck.artist = track.artist.unwrap_or_default();
                         deck.retry_track_at = None;
+                        if deck.artist.is_empty() {
+                            println!("\nDeck {} track change: {} ({})", i + 1, deck.title, id);
+                        } else {
+                            println!("\nDeck {} track change: {} - {} ({})", i + 1, deck.artist, deck.title, id);
+                        }
                     }
                     None => {
                         // Bearer may have changed, or the API isn't up yet; try again in a second
@@ -311,8 +338,23 @@ impl BeatKeeper {
 
 const CHARS: [&str; 4] = ["|", "/", "-", "\\"];
 
-/// Look up a track's (folder path, file name) through Rekordbox's local API.
-fn fetch_track(track_id: i32, api_key: &str) -> Option<(String, String)> {
+/// A track as returned by Rekordbox's local API.
+struct TrackMeta {
+    /// Full path to the file (FolderPath)
+    path: String,
+    /// FileNameL
+    file_name: String,
+    title: Option<String>,
+    artist: Option<String>,
+}
+
+/// A non-empty string field, if there is one.
+fn text_field(v: &serde_json::Value) -> Option<String> {
+    v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+}
+
+/// Look up a track's path and metadata through Rekordbox's local API.
+fn fetch_track(track_id: i32, api_key: &str) -> Option<TrackMeta> {
     let client = reqwest::blocking::Client::new();
     let response = client
         .get(format!("http://127.0.0.1:30001/api/v1/data/djmdContents/{}/", track_id))
@@ -326,10 +368,31 @@ fn fetch_track(track_id: i32, api_key: &str) -> Option<(String, String)> {
         .ok()?;
     let res: serde_json::Value = serde_json::from_str(&response).ok()?;
     let item = &res["item"];
-    Some((
-        item["FolderPath"].as_str()?.to_string(),
-        item["FileNameL"].as_str()?.to_string(),
-    ))
+    let track = TrackMeta {
+        path: item["FolderPath"].as_str()?.to_string(),
+        file_name: item["FileNameL"].as_str()?.to_string(),
+        // Same column name as in Rekordbox's djmdContent table
+        title: text_field(&item["Title"]),
+        // djmdContent itself only has an ArtistID; use a name only if the API includes one.
+        // Check TRACK_JSON_LOG for the real field names.
+        artist: text_field(&item["ArtistName"]).or_else(|| text_field(&item["Artist"]["Name"])),
+    };
+    log_track_json_once(&res);
+    Some(track)
+}
+
+/// Save the first successful djmdContents response (once per run) to see the real field names.
+fn log_track_json_once(res: &serde_json::Value) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let pretty = serde_json::to_string_pretty(res).unwrap_or_default();
+    let keys: Vec<&str> = res["item"].as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+    match std::fs::write(TRACK_JSON_LOG, pretty) {
+        Ok(()) => println!("\nSaved the raw track JSON to {TRACK_JSON_LOG}. Fields: {}", keys.join(", ")),
+        Err(e) => println!("\nCould not write {TRACK_JSON_LOG} ({e}). Track fields: {}", keys.join(", ")),
+    }
 }
 
 fn main() {
@@ -352,6 +415,8 @@ fn main() {
     versions.reverse();
     let mut target_version = versions[0].clone();
     let mut poll_rate: u64 = 60;
+    let mut visuals_target = visuals::DEFAULT_TARGET.to_string();
+    let mut use_soundswitch = true;
 
     let mut args_iter = args.iter();
     args_iter.next();
@@ -381,10 +446,18 @@ fn main() {
                         "v" => {
                             target_version = args_iter.next().unwrap().to_string();
                         }
+                        "t" => match args_iter.next() {
+                            Some(t) => visuals_target = t.to_string(),
+                            None => println!("-t needs a value (host[:port] or off). Using {}", visuals_target),
+                        },
+                        "n" => {
+                            use_soundswitch = false;
+                        }
                         "h" => {
                             println!(
                                 " - Rekordbox OS2L v{} -
-A tool for sending Rekordbox deck state (track, time, bpm, channel faders) to SoundSwitch (based on VirtualDJ communication)
+A tool for sending Rekordbox deck state (track, time, bpm, channel faders) to SoundSwitch (based on VirtualDJ communication),
+and the master track, BPM and beats to a DJ Visuals server over UDP.
 
 Flags:
 
@@ -394,7 +467,11 @@ Flags:
 
  -p  Change poll value
 
-Use r to resend deck paths/tracks to soundswitch.
+ -t  DJ Visuals target, host[:port] (port defaults to {}), eg. 192.168.1.50 or visuals.local:9100.
+     Use -t off to disable. Default: {}
+ -n  Run without SoundSwitch (no discovery/connect), eg. to only feed DJ Visuals
+
+Use r to resend deck paths/tracks to soundswitch (and the master track to DJ Visuals).
 Use y to reset and resend deck paths/tracks to soundswitch (useful for changing to Autoloop override during a song).
 
 Everything SoundSwitch sends back is printed and logged to soundswitch_rx.log.
@@ -402,6 +479,8 @@ Everything SoundSwitch sends back is printed and logged to soundswitch_rx.log.
 Current default version: {}
 Available versions:",
                                 env!("CARGO_PKG_VERSION"),
+                                visuals::DEFAULT_PORT,
+                                visuals::DEFAULT_TARGET,
                                 versions[0]
                             );
                             println!("{}", versions.join(", "));
@@ -426,6 +505,27 @@ Available versions:",
     };
     println!("Targeting Rekordbox version {target_version}");
 
+    // DJ Visuals output (UDP, fire-and-forget)
+    let mut visuals = if visuals_target.eq_ignore_ascii_case("off") {
+        println!("DJ Visuals output disabled");
+        None
+    } else {
+        match parse_target(&visuals_target).and_then(|addr| Visuals::new(addr).map_err(|e| e.to_string())) {
+            Ok(v) => {
+                println!("Sending to DJ Visuals at {} (UDP)", v.target());
+                Some(v)
+            }
+            Err(e) => {
+                println!("DJ Visuals output disabled: bad target '{visuals_target}': {e}");
+                None
+            }
+        }
+    };
+    if !use_soundswitch && visuals.is_none() {
+        println!("Nothing to send to: SoundSwitch is off (-n) and so is DJ Visuals.");
+        return;
+    }
+
     println!();
     println!(
         "Press r to resend deck paths. y to reset deck paths. c to quit. -h flag for help and version info."
@@ -443,7 +543,13 @@ Available versions:",
     keeper.update_api_bearer();
     println!("API key: {}", keeper.api_bearer);
 
-    let mut os2l = Os2l::connect();
+    // Discovery and (re)connecting run in the background, so the loop (and the visuals) keep going meanwhile.
+    let mut soundswitch = if use_soundswitch {
+        Some(SoundSwitch::start())
+    } else {
+        println!("SoundSwitch disabled (-n)");
+        None
+    };
 
     // Due to Windows timers having a default resolution 0f 15.6ms, we need to use a "too high"
     // value to acheive ~60Hz
@@ -460,29 +566,42 @@ Available versions:",
         last_instant = Instant::now();
 
         keeper.update(); // Read values from Rekordbox memory
+        let new_beat = keeper.take_new_beat();
 
-        if os2l.is_broken() {
-            println!("\nReconnecting to SoundSwitch...");
-            os2l = Os2l::connect(); // fresh connection: everything below is resent
+        if let Some(os2l) = soundswitch.as_mut().and_then(SoundSwitch::poll) {
+            // Per-deck state. Os2l only sends values that changed since last time.
+            for i in 0..DECKS {
+                let deck = &keeper.decks[i];
+                os2l.deck_track(i, &deck.path);
+                os2l.deck_play(i, deck.playing);
+                os2l.deck_level(i, deck.level);
+                os2l.deck_beatpos(i, deck.beats);
+                os2l.deck_time(i, deck.time);
+            }
+            // Rekordbox only exposes the master deck's BPM
+            if let Some(m) = keeper.master {
+                os2l.deck_bpm(m, keeper.bpm);
+            }
+
+            if new_beat {
+                // Rekordbox beats are 1..4 within a bar; OS2L wants pos % 4 == 0 on the downbeat
+                os2l.beat(keeper.last_beat - 1, keeper.bpm);
+            }
         }
 
-        // Per-deck state. Os2l only sends values that changed since last time.
-        for i in 0..DECKS {
-            let deck = &keeper.decks[i];
-            os2l.deck_track(i, &deck.path);
-            os2l.deck_play(i, deck.playing);
-            os2l.deck_level(i, deck.level);
-            os2l.deck_beatpos(i, deck.beats);
-            os2l.deck_time(i, deck.time);
-        }
-        // Rekordbox only exposes the master deck's BPM
-        if let Some(m) = keeper.master {
-            os2l.deck_bpm(m, keeper.bpm);
-        }
-
-        if keeper.take_new_beat() {
-            // Rekordbox beats are 1..4 within a bar; OS2L wants pos % 4 == 0 on the downbeat
-            os2l.beat(keeper.last_beat - 1, keeper.bpm);
+        if let Some(vis) = visuals.as_mut() {
+            if let Some(m) = keeper.master {
+                // Only the track that is playing out loud (the master deck's), not whatever gets loaded on the other deck
+                let deck = &keeper.decks[m];
+                if deck.track_resolved() {
+                    vis.master_track(m, deck.track_id, &deck.path, &deck.title, &deck.artist, keeper.bpm);
+                }
+            }
+            vis.bpm(keeper.bpm);
+            // Only while the master deck plays, so scrubbing/cueing a stopped deck doesn't jerk the visuals
+            if new_beat && keeper.master.is_some_and(|m| keeper.decks[m].playing) {
+                vis.beat(beat_in_bar(keeper.last_beat));
+            }
         }
 
         while let Ok(key) = rx.try_recv() {
@@ -494,10 +613,19 @@ Available versions:",
                 114 | 121 => {
                     //"r" resend, "y" reset + resend
                     let reset = key == 121;
-                    for i in 0..DECKS {
-                        let deck = &keeper.decks[i];
-                        println!("\nDeck {} {}: {:?}", i + 1, if reset { "reset" } else { "resend" }, deck.path);
-                        os2l.resend_track(i, &deck.path, reset);
+                    match soundswitch.as_mut().and_then(SoundSwitch::connection) {
+                        Some(os2l) => {
+                            for i in 0..DECKS {
+                                let deck = &keeper.decks[i];
+                                println!("\nDeck {} {}: {:?}", i + 1, if reset { "reset" } else { "resend" }, deck.path);
+                                os2l.resend_track(i, &deck.path, reset);
+                            }
+                        }
+                        None if use_soundswitch => println!("\nSoundSwitch is not connected yet"),
+                        None => {}
+                    }
+                    if let Some(vis) = visuals.as_mut() {
+                        vis.resend_track();
                     }
                 }
                 _ => (),
@@ -519,6 +647,18 @@ Available versions:",
                 );
             }
             print!("| {: >3}Hz ", 1000000 / (delta.as_micros().max(1)));
+            print!(
+                "| ss {} ",
+                match &soundswitch {
+                    None => "off",
+                    Some(s) if s.is_connected() => "on",
+                    Some(_) => "wait",
+                }
+            );
+            match &visuals {
+                Some(v) => print!("| {} ", v.status()),
+                None => print!("| vis off "),
+            }
             if let Some(m) = keeper.master {
                 print!("| {}   ", keeper.decks[m].title);
             }

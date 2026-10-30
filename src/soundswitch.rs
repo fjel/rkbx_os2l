@@ -4,6 +4,7 @@ use std::{
     net::TcpStream,
     sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc::{channel, Receiver, TryRecvError},
         Arc,
     },
     thread::{sleep, spawn},
@@ -27,16 +28,30 @@ pub struct SoundSwitchConnectionAddr {
 pub struct SoundSwitchConnector;
 
 impl SoundSwitchConnector {
-    pub fn discover_soundswitch() -> SoundSwitchConnectionAddr {
-        let mdns = ServiceDaemon::new().expect("Failed to create daemon");
+    /// Browse mDNS until SoundSwitch shows up. None if mDNS itself fails (the caller retries).
+    pub fn discover_soundswitch() -> Option<SoundSwitchConnectionAddr> {
+        let mdns = match ServiceDaemon::new() {
+            Ok(mdns) => mdns,
+            Err(e) => {
+                eprintln!("\nFailed to create mDNS daemon: {e}");
+                return None;
+            }
+        };
         let service_type = "_os2l._tcp.local.";
-        let receiver = mdns.browse(service_type).expect("Failed to browse");
+        let receiver = match mdns.browse(service_type) {
+            Ok(receiver) => receiver,
+            Err(e) => {
+                eprintln!("\nFailed to browse mDNS: {e}");
+                let _ = mdns.shutdown();
+                return None;
+            }
+        };
 
-        println!("Looking for SoundSwitch application...");
+        println!("\nLooking for SoundSwitch application...");
         while let Ok(event) = receiver.recv() {
             if let ServiceEvent::ServiceResolved(info) = event {
                 let service_name = info.get_fullname();
-                println!("Resolved a new service: {}", service_name);
+                println!("\nResolved a new service: {}", service_name);
                 if !service_name.starts_with("SoundSwitch") {
                     continue;
                 }
@@ -49,10 +64,65 @@ impl SoundSwitchConnector {
                 };
                 println!("SoundSwitch at {}:{}", connection.soundswitch_ip, connection.soundswitch_port);
                 let _ = mdns.shutdown();
-                return connection;
+                return Some(connection);
             }
         }
-        std::process::exit(1);
+        let _ = mdns.shutdown();
+        None
+    }
+}
+
+/// Owns the SoundSwitch connection. Discovery and (re)connecting happen on a background
+/// thread, so a missing or restarting SoundSwitch never blocks the caller's loop.
+pub struct SoundSwitch {
+    conn: Option<Os2l>,
+    pending: Option<Receiver<Os2l>>,
+}
+
+impl SoundSwitch {
+    /// Start looking for SoundSwitch in the background.
+    pub fn start() -> Self {
+        let mut ss = Self { conn: None, pending: None };
+        ss.spawn_connect();
+        ss
+    }
+
+    fn spawn_connect(&mut self) {
+        let (tx, rx) = channel();
+        spawn(move || {
+            let _ = tx.send(Os2l::connect());
+        });
+        self.pending = Some(rx);
+    }
+
+    /// Call once per loop iteration: picks up a finished background connect, starts a new one
+    /// when the connection broke, and returns the live connection if there is one.
+    pub fn poll(&mut self) -> Option<&mut Os2l> {
+        if self.conn.as_ref().is_some_and(|c| c.is_broken()) {
+            println!("\nReconnecting to SoundSwitch...");
+            self.conn = None; // fresh connection: everything is resent once it's back
+            self.spawn_connect();
+        }
+        if let Some(rx) = &self.pending {
+            match rx.try_recv() {
+                Ok(os2l) => {
+                    self.conn = Some(os2l);
+                    self.pending = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.spawn_connect(),
+            }
+        }
+        self.conn.as_mut()
+    }
+
+    /// The live connection, if any (without starting a reconnect).
+    pub fn connection(&mut self) -> Option<&mut Os2l> {
+        self.conn.as_mut()
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.conn.is_some()
     }
 }
 
@@ -94,9 +164,13 @@ fn num(v: f32) -> serde_json::Value {
 
 impl Os2l {
     /// Find SoundSwitch over mDNS and connect, retrying until it works.
+    /// This blocks; use `SoundSwitch` to run it in the background.
     pub fn connect() -> Self {
         loop {
-            let addr = SoundSwitchConnector::discover_soundswitch();
+            let Some(addr) = SoundSwitchConnector::discover_soundswitch() else {
+                sleep(Duration::from_secs(1));
+                continue;
+            };
             match TcpStream::connect((addr.soundswitch_ip.as_str(), addr.soundswitch_port)) {
                 Ok(stream) => return Self::from_stream(stream),
                 Err(e) => {
