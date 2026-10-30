@@ -3,20 +3,38 @@ use std::{collections::HashMap, fs::File, io::Read};
 impl RekordboxOffsets {
     pub fn from_lines(lines: &[String]) -> RekordboxOffsets {
         let mut rows = lines.iter();
+        let rbversion = rows.next().expect("Empty offsets entry").trim().to_string();
+        let mut next = || Pointer::from_string(rows.next().expect("Incomplete offsets entry"));
+        let deck1bar = next();
+        let deck1beat = next();
+        let deck2bar = next();
+        let deck2beat = next();
+        let master_bpm = next();
+        let masterdeck_index = next();
+        let deck1_track_id = next();
+        let deck2_track_id = next();
+        let api_bearer = next();
+        let deck1_time = next();
+        let deck2_time = next();
+        drop(next);
+        // Optional (newer entries only): channel fader position per deck, f64 0..1
+        let deck1_fader = rows.next().map(|s| Pointer::from_string(s));
+        let deck2_fader = rows.next().map(|s| Pointer::from_string(s));
         RekordboxOffsets {
-            rbversion: rows.next().unwrap().to_string(),
-            deck1bar: Pointer::from_string(rows.next().unwrap()),
-            deck1beat: Pointer::from_string(rows.next().unwrap()),
-            deck2bar: Pointer::from_string(rows.next().unwrap()),
-            deck2beat: Pointer::from_string(rows.next().unwrap()),
-            master_bpm: Pointer::from_string(rows.next().unwrap()),
-            masterdeck_index: Pointer::from_string(rows.next().unwrap()),
-            // track_path_baseoffset: hexparse(rows.next().unwrap()),
-            deck1_track_id: Pointer::from_string(rows.next().unwrap()),
-            deck2_track_id: Pointer::from_string(rows.next().unwrap()),
-            api_bearer: Pointer::from_string(rows.next().unwrap()),
-            deck1_time: Pointer::from_string(rows.next().unwrap()),
-            deck2_time: Pointer::from_string(rows.next().unwrap()),
+            rbversion,
+            deck1bar,
+            deck1beat,
+            deck2bar,
+            deck2beat,
+            master_bpm,
+            masterdeck_index,
+            deck1_track_id,
+            deck2_track_id,
+            api_bearer,
+            deck1_time,
+            deck2_time,
+            deck1_fader,
+            deck2_fader,
         }
     }
 
@@ -30,7 +48,7 @@ impl RekordboxOffsets {
 
         let mut lines = vec![];
         for line in contents.lines() {
-            if line.is_empty() {
+            if line.trim().is_empty() {
                 if !lines.is_empty() {
                     let o = RekordboxOffsets::from_lines(&lines);
                     map.insert(o.rbversion.clone(), o);
@@ -60,12 +78,13 @@ pub struct RekordboxOffsets {
     pub deck2beat: Pointer,
     pub master_bpm: Pointer,
     pub masterdeck_index: Pointer,
-    // pub track_path_baseoffset: Pointer,
     pub deck1_track_id: Pointer,
     pub deck2_track_id: Pointer,
     pub api_bearer: Pointer,
     pub deck1_time: Pointer,
-    pub deck2_time: Pointer,  // CHANGE
+    pub deck2_time: Pointer,
+    pub deck1_fader: Option<Pointer>,
+    pub deck2_fader: Option<Pointer>,
 }
 
 #[derive(Clone)]
@@ -83,11 +102,11 @@ impl Pointer {
     }
 
     pub fn from_string(input: &str) -> Self {
-        let split = input.split(' ').map(hexparse).collect::<Vec<usize>>();
+        let split = input.split_whitespace().map(hexparse).collect::<Vec<usize>>();
         Self::new(split[0..split.len() - 1].to_vec(), *split.last().unwrap())
     }
 }
 
 fn hexparse(input: &str) -> usize {
-    usize::from_str_radix(input, 16).unwrap()
+    usize::from_str_radix(input, 16).unwrap_or_else(|_| panic!("Invalid hex value in offsets file: {input}"))
 }

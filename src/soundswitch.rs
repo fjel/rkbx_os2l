@@ -1,11 +1,23 @@
 use std::{
-    io::Write,
-    thread::sleep,
-    time,
+    fs::OpenOptions,
+    io::{Read, Write},
+    net::TcpStream,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::{sleep, spawn},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use std::net::TcpStream;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
+use serde_json::json;
+
+/// Number of decks we read from Rekordbox and report to SoundSwitch.
+pub const DECKS: usize = 2;
+
+/// Everything SoundSwitch sends back to us is appended here (and printed).
+const RX_LOG: &str = "soundswitch_rx.log";
 
 pub struct SoundSwitchConnectionAddr {
     pub soundswitch_ip: String,
@@ -15,109 +27,293 @@ pub struct SoundSwitchConnectionAddr {
 pub struct SoundSwitchConnector;
 
 impl SoundSwitchConnector {
-
     pub fn discover_soundswitch() -> SoundSwitchConnectionAddr {
-        // Create a daemon
         let mdns = ServiceDaemon::new().expect("Failed to create daemon");
-        
-        // Browse for a service type.
         let service_type = "_os2l._tcp.local.";
         let receiver = mdns.browse(service_type).expect("Failed to browse");
-        
-        // Receive the browse events in sync or async. Here is
-        // an example of using a thread. Users can call `receiver.recv_async().await`
-        // if running in async environment.
 
         println!("Looking for SoundSwitch application...");
-        let connection: SoundSwitchConnectionAddr;
         while let Ok(event) = receiver.recv() {
-            match event {
-                ServiceEvent::ServiceResolved(info) => {
-                    let service_name = info.get_fullname();
-                    println!("Resolved a new service: {}", service_name);
-                    if service_name.starts_with("SoundSwitch") {
-                        println!("Service is SoundSwitch");
-                        connection = SoundSwitchConnectionAddr {
-                            soundswitch_ip: info.get_addresses_v4().iter().next().unwrap().to_string(),
-                            soundswitch_port: info.get_port()
-                        };
-                        println!("SoundSwitch at {}:{}", connection.soundswitch_ip, connection.soundswitch_port);
-                        return connection;
-                    }
-                }
-                _other_event => {
-                    // println!("Received other event: {:?}", &other_event);
+            if let ServiceEvent::ServiceResolved(info) = event {
+                let service_name = info.get_fullname();
+                println!("Resolved a new service: {}", service_name);
+                if !service_name.starts_with("SoundSwitch") {
                     continue;
                 }
+                let Some(ip) = info.get_addresses_v4().iter().next().map(|ip| ip.to_string()) else {
+                    continue;
+                };
+                let connection = SoundSwitchConnectionAddr {
+                    soundswitch_ip: ip,
+                    soundswitch_port: info.get_port(),
+                };
+                println!("SoundSwitch at {}:{}", connection.soundswitch_ip, connection.soundswitch_port);
+                let _ = mdns.shutdown();
+                return connection;
             }
-        };        
+        }
         std::process::exit(1);
     }
-
-    pub fn initial_connect(connection: SoundSwitchConnectionAddr) -> TcpStream {
-        let mut os2l_stream = TcpStream::connect(format!("{}:{}",connection.soundswitch_ip, connection.soundswitch_port)).unwrap();
-        // These values are a guess based on what VirtualDJ sends to SoundSwitch
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 1 get_text '%SOUNDSWITCH_ID'\",\"value\":\"\"}\n").unwrap();
-        sleep(time::Duration::from_millis(20));
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 2 get_text '%SOUNDSWITCH_ID'\",\"value\":\"\"}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 3 get_text '%SOUNDSWITCH_ID'\",\"value\":\"\"}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 4 get_text '%SOUNDSWITCH_ID'\",\"value\":\"\"}\n").unwrap();
-        sleep(time::Duration::from_millis(30));
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 1 level\",\"value\":1}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 2 level\",\"value\":1}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 3 level\",\"value\":1}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 4 level\",\"value\":1}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"crossfader\",\"value\":0.5}\n").unwrap();
-        sleep(time::Duration::from_millis(50));
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 1 get_bpm\",\"value\":120}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 2 get_bpm\",\"value\":120}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 3 get_bpm\",\"value\":120}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 4 get_bpm\",\"value\":120}\n").unwrap();
-        sleep(time::Duration::from_millis(50));
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 1 play\",\"value\":\"off\"}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 2 play\",\"value\":\"off\"}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 3 play\",\"value\":\"off\"}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 4 play\",\"value\":\"off\"}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 1 loop\",\"value\":\"off\"}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 2 loop\",\"value\":\"off\"}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 3 loop\",\"value\":\"off\"}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 4 loop\",\"value\":\"off\"}\n").unwrap();
-        sleep(time::Duration::from_millis(50));
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 1 get_loop\",\"value\":8}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 2 get_loop\",\"value\":16}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 3 get_loop\",\"value\":8}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 4 get_loop\",\"value\":8}\n").unwrap();
-        sleep(time::Duration::from_millis(50));
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 1 loop_roll 0.03125 ? constant 0.03125 : deck 1 loop_roll 0.0625 ? constant 0.0625 : deck 1 loop_roll 0.125 ? constant 0.125 : deck 1 loop_roll 0.25 ? constant 0.25 : deck 1 loop_roll 0.5 ? constant 0.5 : deck 1 loop_roll 0.75 ? constant 0.75 : deck 1 loop_roll 1 ? constant 1 : deck 1 loop_roll 2 ? constant 2 : deck 1 loop_roll 4 ? constant 4 : constant 0\",\"value\":0}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 2 loop_roll 0.03125 ? constant 0.03125 : deck 2 loop_roll 0.0625 ? constant 0.0625 : deck 2 loop_roll 0.125 ? constant 0.125 : deck 2 loop_roll 0.25 ? constant 0.25 : deck 2 loop_roll 0.5 ? constant 0.5 : deck 2 loop_roll 0.75 ? constant 0.75 : deck 2 loop_roll 1 ? constant 1 : deck 2 loop_roll 2 ? constant 2 : deck 2 loop_roll 4 ? constant 4 : constant 0\",\"value\":0}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 3 loop_roll 0.03125 ? constant 0.03125 : deck 3 loop_roll 0.0625 ? constant 0.0625 : deck 3 loop_roll 0.125 ? constant 0.125 : deck 3 loop_roll 0.25 ? constant 0.25 : deck 3 loop_roll 0.5 ? constant 0.5 : deck 3 loop_roll 0.75 ? constant 0.75 : deck 3 loop_roll 1 ? constant 1 : deck 3 loop_roll 2 ? constant 2 : deck 3 loop_roll 4 ? constant 4 : constant 0\",\"value\":0}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 4 loop_roll 0.03125 ? constant 0.03125 : deck 4 loop_roll 0.0625 ? constant 0.0625 : deck 4 loop_roll 0.125 ? constant 0.125 : deck 4 loop_roll 0.25 ? constant 0.25 : deck 4 loop_roll 0.5 ? constant 0.5 : deck 4 loop_roll 0.75 ? constant 0.75 : deck 4 loop_roll 1 ? constant 1 : deck 4 loop_roll 2 ? constant 2 : deck 4 loop_roll 4 ? constant 4 : constant 0\",\"value\":0}\n").unwrap();
-        sleep(time::Duration::from_millis(50));
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 1 get_text '%SOUNDSWITCH_ID'\",\"value\":\"{00000000-0000-0000-0000-000000000000}\"}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 3 get_text '%SOUNDSWITCH_ID'\",\"value\":\"{00000000-0000-0000-0000-000000000000}\"}\n").unwrap();
-        os2l_stream.write(b"{\"evt\":\"subscribed\",\"trigger\":\"deck 4 get_text '%SOUNDSWITCH_ID'\",\"value\":\"{00000000-0000-0000-0000-000000000000}\"}\n").unwrap();
-        sleep(time::Duration::from_millis(50));
-
-        return os2l_stream;
-    }
-
-    pub fn send_beatpos(os2l_stream: &mut TcpStream, last_beat: i32) {
-        os2l_stream.write(format!("{{\"evt\":\"subscribed\",\"trigger\":\"deck 1 get_beatpos\",\"value\":{}}}\n", last_beat).as_str().as_bytes()).unwrap();
-    }
-
-    pub fn send_beat(os2l_stream: &mut TcpStream, last_beat: i32, last_bpm: f32) {
-        os2l_stream.write(format!("{{\"evt\":\"beat\",\"change\":false,\"pos\":{},\"bpm\":{},\"strength\":0}}", last_beat, last_bpm).as_str().as_bytes()).unwrap();
-    }
-
-    pub fn send_track(os2l_stream: &mut TcpStream, last_master_path: &mut String) {
-        let master_path = last_master_path.replace("/", "\\\\"); // Replace slashes with backslashes for serialization
-        os2l_stream.write(format!("{{\"evt\":\"subscribed\",\"trigger\":\"deck 1 get_filepath\",\"value\":\"{}\"}}\n", master_path).as_str().as_bytes()).unwrap();
-    }
-
-    pub fn send_time(os2l_stream: &mut TcpStream, last_time: i32) {
-        os2l_stream.write(format!("{{\"evt\":\"subscribed\",\"trigger\":\"deck 1 get_time elapsed absolute\",\"value\":{}}}\n", last_time).as_str().as_bytes()).unwrap();
-    }
-    
 }
 
+/// What we last told SoundSwitch about a deck, so we only send changes
+/// (the same way VirtualDJ only sends "subscribed" events when a value changes).
+#[derive(Default)]
+struct SentDeck {
+    path: Option<String>,
+    time: Option<i32>,
+    beatpos: Option<i32>,
+    playing: Option<bool>,
+    bpm: Option<f32>,
+    level: Option<f32>,
+    track_changes: u32,
+}
 
+/// An OS2L connection to SoundSwitch that speaks VirtualDJ's "subscribed" dialect.
+pub struct Os2l {
+    stream: TcpStream,
+    broken: bool,
+    closed_by_peer: Arc<AtomicBool>,
+    sent: [SentDeck; DECKS],
+    last_beat: Option<(i32, f32)>,
+}
+
+fn trigger(deck: usize, what: &str) -> String {
+    format!("deck {} {}", deck + 1, what)
+}
+
+/// Whole numbers as integers (VirtualDJ sends `1`, not `1.0`), others rounded to 4 decimals.
+fn num(v: f32) -> serde_json::Value {
+    let v = (v as f64 * 10000.).round() / 10000.;
+    if v.fract() == 0. && v.abs() < 1e9 {
+        json!(v as i64)
+    } else {
+        json!(v)
+    }
+}
+
+impl Os2l {
+    /// Find SoundSwitch over mDNS and connect, retrying until it works.
+    pub fn connect() -> Self {
+        loop {
+            let addr = SoundSwitchConnector::discover_soundswitch();
+            match TcpStream::connect((addr.soundswitch_ip.as_str(), addr.soundswitch_port)) {
+                Ok(stream) => return Self::from_stream(stream),
+                Err(e) => {
+                    eprintln!("Could not connect to SoundSwitch ({e}), retrying...");
+                    sleep(Duration::from_secs(1));
+                }
+            }
+        }
+    }
+
+    fn from_stream(stream: TcpStream) -> Self {
+        // Small, latency-sensitive messages: don't let Nagle batch them.
+        let _ = stream.set_nodelay(true);
+        let closed_by_peer = Arc::new(AtomicBool::new(false));
+        spawn_reader(&stream, closed_by_peer.clone());
+        let mut os2l = Self {
+            stream,
+            broken: false,
+            closed_by_peer,
+            sent: Default::default(),
+            last_beat: None,
+        };
+        os2l.handshake();
+        os2l
+    }
+
+    pub fn is_broken(&self) -> bool {
+        self.broken || self.closed_by_peer.load(Ordering::Relaxed)
+    }
+
+    fn send_line(&mut self, msg: &str) {
+        if self.broken {
+            return;
+        }
+        let mut line = String::with_capacity(msg.len() + 1);
+        line.push_str(msg);
+        line.push('\n');
+        if let Err(e) = self.stream.write_all(line.as_bytes()) {
+            eprintln!("\nLost connection to SoundSwitch: {e}");
+            self.broken = true;
+        }
+    }
+
+    fn subscribed(&mut self, trigger: String, value: serde_json::Value) {
+        // serde_json sorts keys, which gives the same evt/trigger/value order VirtualDJ uses.
+        let msg = json!({ "evt": "subscribed", "trigger": trigger, "value": value });
+        self.send_line(&msg.to_string());
+    }
+
+    /// Initial state, mirroring what VirtualDJ sends right after SoundSwitch connects.
+    /// Live values (level, play, bpm, ...) are sent by the main loop right after this.
+    fn handshake(&mut self) {
+        for d in 1..=4 {
+            self.send_line(&format!("{{\"evt\":\"subscribed\",\"trigger\":\"deck {d} get_text '%SOUNDSWITCH_ID'\",\"value\":\"\"}}"));
+        }
+        sleep(Duration::from_millis(30));
+        for d in 1..=4 {
+            self.send_line(&format!("{{\"evt\":\"subscribed\",\"trigger\":\"deck {d} level\",\"value\":1}}"));
+        }
+        self.send_line("{\"evt\":\"subscribed\",\"trigger\":\"crossfader\",\"value\":0.5}");
+        sleep(Duration::from_millis(50));
+        for d in 1..=4 {
+            self.send_line(&format!("{{\"evt\":\"subscribed\",\"trigger\":\"deck {d} get_bpm\",\"value\":120}}"));
+        }
+        sleep(Duration::from_millis(50));
+        for d in 1..=4 {
+            self.send_line(&format!("{{\"evt\":\"subscribed\",\"trigger\":\"deck {d} play\",\"value\":\"off\"}}"));
+        }
+        for d in 1..=4 {
+            self.send_line(&format!("{{\"evt\":\"subscribed\",\"trigger\":\"deck {d} loop\",\"value\":\"off\"}}"));
+        }
+        sleep(Duration::from_millis(50));
+        for d in 1..=4 {
+            self.send_line(&format!("{{\"evt\":\"subscribed\",\"trigger\":\"deck {d} get_loop\",\"value\":8}}"));
+        }
+        sleep(Duration::from_millis(50));
+        for d in 1..=4 {
+            let sizes = ["0.03125", "0.0625", "0.125", "0.25", "0.5", "0.75", "1", "2", "4"];
+            let expr: Vec<String> = sizes
+                .iter()
+                .map(|s| format!("deck {d} loop_roll {s} ? constant {s}"))
+                .collect();
+            self.send_line(&format!(
+                "{{\"evt\":\"subscribed\",\"trigger\":\"{} : constant 0\",\"value\":0}}",
+                expr.join(" : ")
+            ));
+        }
+        sleep(Duration::from_millis(50));
+        for d in 1..=4 {
+            self.send_line(&format!("{{\"evt\":\"subscribed\",\"trigger\":\"deck {d} get_text '%SOUNDSWITCH_ID'\",\"value\":\"{{00000000-0000-0000-0000-000000000000}}\"}}"));
+        }
+        sleep(Duration::from_millis(50));
+    }
+
+    fn send_track(&mut self, deck: usize, path: &str) {
+        // SoundSwitch matches on the Windows path VirtualDJ would report
+        let win_path = path.replace('/', "\\");
+        self.subscribed(trigger(deck, "get_filepath"), json!(win_path));
+        self.sent[deck].path = Some(path.to_string());
+    }
+
+    /// Report the file loaded on a deck (only sent when it changes).
+    pub fn deck_track(&mut self, deck: usize, path: &str) {
+        if path.is_empty() || self.sent[deck].path.as_deref() == Some(path) {
+            return;
+        }
+        // SoundSwitch sometimes stops following tracks after many changes;
+        // an empty path every 10 changes resets it.
+        self.sent[deck].track_changes += 1;
+        if self.sent[deck].track_changes >= 10 {
+            self.sent[deck].track_changes = 0;
+            self.send_track(deck, "");
+            sleep(Duration::from_millis(20));
+        }
+        self.send_track(deck, path);
+    }
+
+    /// Resend a deck's path, optionally clearing it first (the r / y keys).
+    pub fn resend_track(&mut self, deck: usize, path: &str, reset: bool) {
+        if path.is_empty() {
+            return;
+        }
+        if reset {
+            self.send_track(deck, "");
+            sleep(Duration::from_millis(50));
+        }
+        self.send_track(deck, path);
+    }
+
+    pub fn deck_time(&mut self, deck: usize, ms: i32) {
+        // Time is meaningless to SoundSwitch until it knows which file is on the deck.
+        if self.sent[deck].path.is_none() || self.sent[deck].time == Some(ms) {
+            return;
+        }
+        self.sent[deck].time = Some(ms);
+        self.subscribed(trigger(deck, "get_time elapsed absolute"), json!(ms));
+    }
+
+    pub fn deck_beatpos(&mut self, deck: usize, beats: i32) {
+        if beats < 0 || self.sent[deck].beatpos == Some(beats) {
+            return;
+        }
+        self.sent[deck].beatpos = Some(beats);
+        self.subscribed(trigger(deck, "get_beatpos"), json!(beats));
+    }
+
+    pub fn deck_play(&mut self, deck: usize, playing: bool) {
+        if self.sent[deck].playing == Some(playing) {
+            return;
+        }
+        self.sent[deck].playing = Some(playing);
+        self.subscribed(trigger(deck, "play"), json!(if playing { "on" } else { "off" }));
+    }
+
+    pub fn deck_bpm(&mut self, deck: usize, bpm: f32) {
+        if !bpm.is_finite() || bpm <= 0. {
+            return;
+        }
+        if let Some(last) = self.sent[deck].bpm {
+            if (last - bpm).abs() < 0.005 {
+                return;
+            }
+        }
+        self.sent[deck].bpm = Some(bpm);
+        self.subscribed(trigger(deck, "get_bpm"), num(bpm));
+    }
+
+    /// Channel fader position, 0..1. This is what SoundSwitch uses to mix lighting between decks.
+    pub fn deck_level(&mut self, deck: usize, level: f32) {
+        let level = level.clamp(0., 1.);
+        if let Some(last) = self.sent[deck].level {
+            if (last - level).abs() < 0.002 {
+                return;
+            }
+        }
+        self.sent[deck].level = Some(level);
+        self.subscribed(trigger(deck, "level"), num(level));
+    }
+
+    /// Standard OS2L beat message. `pos` should be divisible by 4 on bar boundaries.
+    pub fn beat(&mut self, pos: i32, bpm: f32) {
+        let change = match self.last_beat {
+            Some((last_pos, last_bpm)) => pos != last_pos + 1 || (bpm - last_bpm).abs() > 0.01,
+            None => true,
+        };
+        self.last_beat = Some((pos, bpm));
+        self.send_line(&format!(
+            "{{\"evt\":\"beat\",\"change\":{},\"pos\":{},\"bpm\":{},\"strength\":0}}",
+            change,
+            pos,
+            num(bpm)
+        ));
+    }
+}
+
+/// Dump everything SoundSwitch sends (its "subscribe" list, feedback, ...) to the console and RX_LOG.
+fn spawn_reader(stream: &TcpStream, closed: Arc<AtomicBool>) {
+    let Ok(mut rd) = stream.try_clone() else {
+        return;
+    };
+    spawn(move || {
+        let mut log = OpenOptions::new().create(true).append(true).open(RX_LOG).ok();
+        let mut buf = [0u8; 16384];
+        loop {
+            match rd.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let text = String::from_utf8_lossy(&buf[..n]);
+                    println!("\n[SoundSwitch -> rkbx_os2l] {}", text.trim_end());
+                    if let Some(f) = log.as_mut() {
+                        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+                        let _ = writeln!(f, "[{ts}] {}", text.trim_end());
+                    }
+                }
+            }
+        }
+        closed.store(true, Ordering::Relaxed);
+        println!("\nSoundSwitch closed the connection");
+    });
+}
