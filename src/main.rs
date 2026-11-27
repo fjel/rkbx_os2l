@@ -119,14 +119,36 @@ pub struct Rekordbox {
     pub track_id: [i32; DECKS],
     pub fader: [Option<f32>; DECKS],
     pub api_bearer: String,
+
+    /// Raw reads for the -d debug line (None = pointer didn't resolve or read failed)
+    pub raw_bpm: Option<f32>,
+    pub raw_masterdeck: Option<u8>,
+    pub raw_bar: [Option<i32>; DECKS],
+    pub raw_beat: [Option<i32>; DECKS],
+    pub raw_time: [Option<i32>; DECKS],
+    pub raw_track_id: [Option<i32>; DECKS],
 }
 
 impl Rekordbox {
     fn new(o: &RekordboxOffsets) -> Self {
-        let rb = Process::from_process_name("rekordbox.exe")
-            .expect("Could not find Rekordbox process! ");
-        let handle = rb.process_handle;
-        let base = rb.get_module_base("rekordbox.exe").unwrap();
+        // Wait for Rekordbox instead of exiting, so the tool can be started first
+        let mut waiting = false;
+        let (handle, base) = loop {
+            let found = Process::from_process_name("rekordbox.exe")
+                .ok()
+                .and_then(|rb| rb.get_module_base("rekordbox.exe").ok().map(|base| (rb.process_handle, base)));
+            if let Some(found) = found {
+                if waiting {
+                    println!("Found Rekordbox");
+                }
+                break found;
+            }
+            if !waiting {
+                println!("Waiting for Rekordbox (rekordbox.exe) to start... Ctrl+C to quit.");
+                waiting = true;
+            }
+            sleep(Duration::from_secs(1));
+        };
 
         let mut rb = Self {
             handle,
@@ -157,6 +179,13 @@ impl Rekordbox {
             track_id: [0; DECKS],
             fader: [None; DECKS],
             api_bearer: String::new(),
+
+            raw_bpm: None,
+            raw_masterdeck: None,
+            raw_bar: [None; DECKS],
+            raw_beat: [None; DECKS],
+            raw_time: [None; DECKS],
+            raw_track_id: [None; DECKS],
         };
         rb.update();
         rb
@@ -165,27 +194,34 @@ impl Rekordbox {
     fn update(&mut self) {
         let (h, b) = (self.handle, self.base);
 
-        ensure(&mut self.master_bpm_val, h, b, &self.bpm_ptr);
-        ensure(&mut self.masterdeck_index_val, h, b, &self.masterdeck_ptr);
-        self.master_bpm = read_opt(&self.master_bpm_val).unwrap_or(120.0);
-        self.masterdeck_index = read_opt(&self.masterdeck_index_val).unwrap_or(255);
+        // Re-resolve every pointer chain on every update: Rekordbox reallocates objects (e.g. the
+        // deck objects when a track is loaded), and a cached address then goes stale for good.
+        // It's only a few dozen small reads per update.
+        self.master_bpm_val = Value::new(h, b, self.bpm_ptr.clone());
+        self.masterdeck_index_val = Value::new(h, b, self.masterdeck_ptr.clone());
+        self.raw_bpm = read_opt(&self.master_bpm_val);
+        self.raw_masterdeck = read_opt(&self.masterdeck_index_val);
+        self.master_bpm = self.raw_bpm.unwrap_or(120.0);
+        self.masterdeck_index = self.raw_masterdeck.unwrap_or(255);
 
         for i in 0..DECKS {
-            ensure(&mut self.bar_val[i], h, b, &self.bar_ptr[i]);
-            ensure(&mut self.beat_val[i], h, b, &self.beat_ptr[i]);
-            ensure(&mut self.time_val[i], h, b, &self.time_ptr[i]);
-            ensure(&mut self.track_id_val[i], h, b, &self.track_id_ptr[i]);
+            self.bar_val[i] = Value::new(h, b, self.bar_ptr[i].clone());
+            self.beat_val[i] = Value::new(h, b, self.beat_ptr[i].clone());
+            self.time_val[i] = Value::new(h, b, self.time_ptr[i].clone());
+            self.track_id_val[i] = Value::new(h, b, self.track_id_ptr[i].clone());
             if let Some(p) = &self.fader_ptr[i] {
-                // Re-resolve every time: the mixer object can be (re)allocated after startup,
-                // and this is only a few extra reads.
                 self.fader_val[i] = Value::new(h, b, p.clone());
             }
 
-            if let (Some(bar), Some(beat)) = (read_opt(&self.bar_val[i]), read_opt(&self.beat_val[i])) {
+            self.raw_bar[i] = read_opt(&self.bar_val[i]);
+            self.raw_beat[i] = read_opt(&self.beat_val[i]);
+            if let (Some(bar), Some(beat)) = (self.raw_bar[i], self.raw_beat[i]) {
                 self.beats[i] = bar * 4 + beat;
             }
-            self.time[i] = read_opt(&self.time_val[i]).unwrap_or(0);
-            self.track_id[i] = read_opt(&self.track_id_val[i]).unwrap_or(0);
+            self.raw_time[i] = read_opt(&self.time_val[i]);
+            self.raw_track_id[i] = read_opt(&self.track_id_val[i]);
+            self.time[i] = self.raw_time[i].unwrap_or(0);
+            self.track_id[i] = self.raw_track_id[i].unwrap_or(0);
             // Channel fader position is stored as an f64, linear 0..1
             self.fader[i] = read_opt(&self.fader_val[i]).map(|f| f as f32).filter(|f| f.is_finite());
         }
@@ -331,12 +367,142 @@ impl BeatKeeper {
         self.api_bearer = self.rb.api_bearer.clone();
     }
 
+    /// One line of raw Rekordbox values, for checking offsets (-d).
+    pub fn debug_line(&self) -> String {
+        fn o<T: std::fmt::Display>(v: Option<T>) -> String {
+            v.map_or("?".to_string(), |v| v.to_string())
+        }
+        let rb = &self.rb;
+        let mut line = format!(
+            "[debug] master idx {} bpm {}",
+            o(rb.raw_masterdeck),
+            rb.raw_bpm.map_or("?".to_string(), |b| format!("{b:.2}"))
+        );
+        for i in 0..DECKS {
+            line += &format!(
+                " | D{} bar {} beat {} time {}ms id {} fader {}",
+                i + 1,
+                o(rb.raw_bar[i]),
+                o(rb.raw_beat[i]),
+                o(rb.raw_time[i]),
+                o(rb.raw_track_id[i]),
+                rb.fader[i].map_or("?".to_string(), |f| format!("{f:.3}")),
+            );
+        }
+        line
+    }
+
     pub fn take_new_beat(&mut self) -> bool {
         std::mem::replace(&mut self.new_beat, false)
     }
 }
 
 const CHARS: [&str; 4] = ["|", "/", "-", "\\"];
+
+/// Visible width of the console window in characters, or None if stdout isn't a console.
+fn console_width() -> Option<usize> {
+    use winapi::um::processenv::GetStdHandle;
+    use winapi::um::winbase::STD_OUTPUT_HANDLE;
+    use winapi::um::wincon::{GetConsoleScreenBufferInfo, CONSOLE_SCREEN_BUFFER_INFO};
+    unsafe {
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut info) == 0 {
+            return None;
+        }
+        // Lines wrap at the buffer width; the window can be narrower than that (old conhost)
+        let window = info.srWindow.Right as i32 - info.srWindow.Left as i32 + 1;
+        let width = window.min(info.dwSize.X as i32);
+        (width > 0).then_some(width as usize)
+    }
+}
+
+/// Cut `line` to fit the console and pad it with spaces, so it overwrites the previous status
+/// line in place (with \r) instead of wrapping onto a new line.
+fn fit_to_console(line: &str) -> String {
+    let Some(width) = console_width() else {
+        return line.to_string();
+    };
+    // Leave the last column empty: writing into it makes some consoles wrap anyway
+    let max = width.saturating_sub(1);
+    let mut out: String = line.chars().take(max).collect();
+    let len = out.chars().count();
+    out.extend(std::iter::repeat(' ').take(max - len));
+    out
+}
+
+/// SoundSwitch messages that are not sent. Set by the mode (legacy by default, -f for fader
+/// mode) and by -x for troubleshooting. All false sends everything.
+#[derive(Default, Clone, Copy)]
+struct SsSkip {
+    beat: bool,
+    play: bool,
+    level: bool,
+    bpm: bool,
+    time: bool,
+    beatpos: bool,
+    /// Send only the master deck, as deck 1 (like v0.0.3)
+    deck1: bool,
+}
+
+impl SsSkip {
+    /// What v0.0.3 sent, the default mode: only the master deck's track, time and beatpos, as deck 1.
+    /// Sending both decks and the channel faders (-f) made SoundSwitch stop following some users' sets.
+    fn legacy() -> Self {
+        Self {
+            deck1: true,
+            play: true,
+            level: true,
+            bpm: true,
+            beat: true,
+            ..Self::default()
+        }
+    }
+
+    /// Skip everything that either one skips.
+    fn or(self, o: Self) -> Self {
+        Self {
+            beat: self.beat || o.beat,
+            play: self.play || o.play,
+            level: self.level || o.level,
+            bpm: self.bpm || o.bpm,
+            time: self.time || o.time,
+            beatpos: self.beatpos || o.beatpos,
+            deck1: self.deck1 || o.deck1,
+        }
+    }
+
+    fn parse(list: &str) -> Self {
+        let mut s = Self::default();
+        for item in list.split(',').map(|i| i.trim().to_lowercase()).filter(|i| !i.is_empty()) {
+            match item.as_str() {
+                "beat" => s.beat = true,
+                "play" => s.play = true,
+                "level" => s.level = true,
+                "bpm" => s.bpm = true,
+                "time" => s.time = true,
+                "beatpos" => s.beatpos = true,
+                "deck1" => s.deck1 = true,
+                // Only what v0.0.3 sent: track, time and beatpos of the master deck as deck 1
+                "v3" => s = s.or(Self::legacy()),
+                other => println!("-x: unknown item '{other}' (use beat, play, level, bpm, time, beatpos, deck1, v3)"),
+            }
+        }
+        s
+    }
+
+    fn describe(&self) -> String {
+        let names = [
+            (self.beat, "beat"),
+            (self.play, "play"),
+            (self.level, "level"),
+            (self.bpm, "bpm"),
+            (self.time, "time"),
+            (self.beatpos, "beatpos"),
+            (self.deck1, "deck1"),
+        ];
+        names.iter().filter(|(on, _)| *on).map(|(_, n)| *n).collect::<Vec<_>>().join(",")
+    }
+}
 
 /// A track as returned by Rekordbox's local API.
 struct TrackMeta {
@@ -415,8 +581,13 @@ fn main() {
     versions.reverse();
     let mut target_version = versions[0].clone();
     let mut poll_rate: u64 = 60;
-    let mut visuals_target = visuals::DEFAULT_TARGET.to_string();
+    // DJ Visuals is off unless a target is given with -t
+    let mut visuals_target = "off".to_string();
     let mut use_soundswitch = true;
+    let mut debug = false;
+    let mut ss_skip = SsSkip::default();
+    // Both decks + channel faders to SoundSwitch (-f). Off by default: legacy master-deck-only mode.
+    let mut fader_mode = false;
 
     let mut args_iter = args.iter();
     args_iter.next();
@@ -453,10 +624,20 @@ fn main() {
                         "n" => {
                             use_soundswitch = false;
                         }
+                        "d" => {
+                            debug = true;
+                        }
+                        "f" => {
+                            fader_mode = true;
+                        }
+                        "x" => match args_iter.next() {
+                            Some(list) => ss_skip = SsSkip::parse(list),
+                            None => println!("-x needs a list, eg. -x beat,play"),
+                        },
                         "h" => {
                             println!(
                                 " - Rekordbox OS2L v{} -
-A tool for sending Rekordbox deck state (track, time, bpm, channel faders) to SoundSwitch (based on VirtualDJ communication),
+A tool for sending Rekordbox deck state (track, time, beat position) to SoundSwitch (based on VirtualDJ communication),
 and the master track, BPM and beats to a DJ Visuals server over UDP.
 
 Flags:
@@ -467,9 +648,17 @@ Flags:
 
  -p  Change poll value
 
- -t  DJ Visuals target, host[:port] (port defaults to {}), eg. 192.168.1.50 or visuals.local:9100.
-     Use -t off to disable. Default: {}
+ -t  Send to a DJ Visuals server at host[:port] (port defaults to {}), eg. {} for this machine,
+     192.168.1.50 or visuals.local:9100. Off by default.
  -n  Run without SoundSwitch (no discovery/connect), eg. to only feed DJ Visuals
+ -f  Fader mode: send both decks to SoundSwitch, with channel faders, play state and BPM.
+     Default (without -f) is the classic mode: only the master deck, sent as deck 1.
+     Fader mode needs \"External mixer\" turned off in SoundSwitch's settings. If you mix with
+     the channel faders (not the crossfader), also turn on \"Upfader only\", or the lights only reach half brightness.
+ -d  Print the raw values read from Rekordbox once a second (for checking offsets; ? = not readable)
+ -x  Don't send some SoundSwitch messages (for troubleshooting, mostly with -f), comma separated:
+     beat, play, level, bpm, time, beatpos, deck1 (only the master deck, as deck 1),
+     or v3 (only what v0.0.3 sent: master deck track/time/beatpos as deck 1)
 
 Use r to resend deck paths/tracks to soundswitch (and the master track to DJ Visuals).
 Use y to reset and resend deck paths/tracks to soundswitch (useful for changing to Autoloop override during a song).
@@ -507,7 +696,7 @@ Available versions:",
 
     // DJ Visuals output (UDP, fire-and-forget)
     let mut visuals = if visuals_target.eq_ignore_ascii_case("off") {
-        println!("DJ Visuals output disabled");
+        println!("DJ Visuals output off (use -t host[:port] to enable)");
         None
     } else {
         match parse_target(&visuals_target).and_then(|addr| Visuals::new(addr).map_err(|e| e.to_string())) {
@@ -522,7 +711,7 @@ Available versions:",
         }
     };
     if !use_soundswitch && visuals.is_none() {
-        println!("Nothing to send to: SoundSwitch is off (-n) and so is DJ Visuals.");
+        println!("Nothing to send to: SoundSwitch is off (-n) and DJ Visuals has no target (use -t host[:port]).");
         return;
     }
 
@@ -533,10 +722,17 @@ Available versions:",
     println!();
 
     let mut keeper = BeatKeeper::new(offsets);
-    if keeper.has_faders() {
-        println!("Channel fader offsets found: sending live deck levels");
-    } else {
-        println!("No channel fader offsets for this version: sending master deck as level 1, others as 0");
+    if use_soundswitch {
+        if fader_mode {
+            println!("SoundSwitch: fader mode (-f), sending both decks");
+            if keeper.has_faders() {
+                println!("Channel fader offsets found: sending live deck levels");
+            } else {
+                println!("No channel fader offsets for this version: sending master deck as level 1, others as 0");
+            }
+        } else {
+            println!("SoundSwitch: classic mode, sending the master deck as deck 1 (use -f for both decks + faders)");
+        }
     }
 
     // Get API bearer key
@@ -550,6 +746,13 @@ Available versions:",
         println!("SoundSwitch disabled (-n)");
         None
     };
+    let skipped = ss_skip.describe();
+    if use_soundswitch && !skipped.is_empty() {
+        println!("Not sending to SoundSwitch (-x): {skipped}");
+    }
+    if !fader_mode {
+        ss_skip = ss_skip.or(SsSkip::legacy());
+    }
 
     // Due to Windows timers having a default resolution 0f 15.6ms, we need to use a "too high"
     // value to acheive ~60Hz
@@ -569,21 +772,37 @@ Available versions:",
         let new_beat = keeper.take_new_beat();
 
         if let Some(os2l) = soundswitch.as_mut().and_then(SoundSwitch::poll) {
+            // (SoundSwitch deck, Rekordbox deck) pairs
+            let decks: Vec<(usize, usize)> = if ss_skip.deck1 {
+                keeper.master.map(|m| vec![(0, m)]).unwrap_or_default()
+            } else {
+                (0..DECKS).map(|i| (i, i)).collect()
+            };
             // Per-deck state. Os2l only sends values that changed since last time.
-            for i in 0..DECKS {
+            for (out, i) in decks {
                 let deck = &keeper.decks[i];
-                os2l.deck_track(i, &deck.path);
-                os2l.deck_play(i, deck.playing);
-                os2l.deck_level(i, deck.level);
-                os2l.deck_beatpos(i, deck.beats);
-                os2l.deck_time(i, deck.time);
+                os2l.deck_track(out, &deck.path);
+                if !ss_skip.play {
+                    os2l.deck_play(out, deck.playing);
+                }
+                if !ss_skip.level {
+                    os2l.deck_level(out, deck.level);
+                }
+                if !ss_skip.beatpos {
+                    os2l.deck_beatpos(out, deck.beats);
+                }
+                if !ss_skip.time {
+                    os2l.deck_time(out, deck.time);
+                }
             }
             // Rekordbox only exposes the master deck's BPM
             if let Some(m) = keeper.master {
-                os2l.deck_bpm(m, keeper.bpm);
+                if !ss_skip.bpm {
+                    os2l.deck_bpm(if ss_skip.deck1 { 0 } else { m }, keeper.bpm);
+                }
             }
 
-            if new_beat {
+            if new_beat && !ss_skip.beat {
                 // Rekordbox beats are 1..4 within a bar; OS2L wants pos % 4 == 0 on the downbeat
                 os2l.beat(keeper.last_beat - 1, keeper.bpm);
             }
@@ -615,10 +834,15 @@ Available versions:",
                     let reset = key == 121;
                     match soundswitch.as_mut().and_then(SoundSwitch::connection) {
                         Some(os2l) => {
-                            for i in 0..DECKS {
+                            let decks: Vec<(usize, usize)> = if ss_skip.deck1 {
+                                keeper.master.map(|m| vec![(0, m)]).unwrap_or_default()
+                            } else {
+                                (0..DECKS).map(|i| (i, i)).collect()
+                            };
+                            for (out, i) in decks {
                                 let deck = &keeper.decks[i];
                                 println!("\nDeck {} {}: {:?}", i + 1, if reset { "reset" } else { "resend" }, deck.path);
-                                os2l.resend_track(i, &deck.path, reset);
+                                os2l.resend_track(out, &deck.path, reset);
                             }
                         }
                         None if use_soundswitch => println!("\nSoundSwitch is not connected yet"),
@@ -634,9 +858,9 @@ Available versions:",
 
         if count % 20 == 0 {
             step = (step + 1) % 4;
-            print!("\rRunning {} ", CHARS[step]);
+            let mut line = format!("Running {} ", CHARS[step]);
             for (i, d) in keeper.decks.iter().enumerate() {
-                print!(
+                line += &format!(
                     "| D{}{} {} [{:02}:{:02}] lvl {:.2} ",
                     i + 1,
                     if keeper.master == Some(i) { "*" } else { " " },
@@ -646,8 +870,8 @@ Available versions:",
                     d.level,
                 );
             }
-            print!("| {: >3}Hz ", 1000000 / (delta.as_micros().max(1)));
-            print!(
+            line += &format!("| {: >3}Hz ", 1000000 / (delta.as_micros().max(1)));
+            line += &format!(
                 "| ss {} ",
                 match &soundswitch {
                     None => "off",
@@ -656,13 +880,17 @@ Available versions:",
                 }
             );
             match &visuals {
-                Some(v) => print!("| {} ", v.status()),
-                None => print!("| vis off "),
+                Some(v) => line += &format!("| {} ", v.status()),
+                None => line += "| vis off ",
             }
             if let Some(m) = keeper.master {
-                print!("| {}   ", keeper.decks[m].title);
+                line += &format!("| {}", keeper.decks[m].title);
             }
+            print!("\r{}", fit_to_console(&line));
             stdout.flush().unwrap();
+        }
+        if debug && count % 60 == 0 {
+            println!("\n{}", keeper.debug_line());
         }
         count = (count + 1) % 120;
 

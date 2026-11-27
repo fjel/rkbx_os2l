@@ -5,9 +5,9 @@ When run on the same computer as an instance of Rekordbox and SoundSwitch, it wi
 ## Features
 - Automatically discover SoundSwitch on the local machine.
 - Autoloops with beat syncing
-- Full autoscript support when using VirtualDJ to prepare the tracks.
+- Full autoscript support, with tracks scripted in SoundSwitch's Rekordbox mode (no VirtualDJ needed) or prepared with VirtualDJ.
 - Reads values from rekordbox memory, does not crash or interfere with rekordbox
-- Sends the master track, BPM and beats to a DJ Visuals server over UDP (on by default, see below)
+- Can send the master track, BPM and beats to a DJ Visuals server over UDP (off by default, enable with `-t`, see below)
 - SoundSwitch discovery and reconnects run in the background, so a missing SoundSwitch never stalls the visuals
 
 
@@ -27,21 +27,33 @@ where
 
  -p  Change poll value
 
- -t  DJ Visuals target, host[:port] (port defaults to 9099), or off. Default: 127.0.0.1:9099
+ -t  Send to a DJ Visuals server at host[:port] (port defaults to 9099), eg. 127.0.0.1. Off by default
  -n  Run without SoundSwitch (no discovery/connect), eg. to only feed DJ Visuals
+ -f  Fader mode: send both decks to SoundSwitch, with channel faders, play state and BPM
+ -d  Print the raw values read from Rekordbox once a second (for checking offsets)
+ -x  Don't send some SoundSwitch messages (for troubleshooting), eg. -x level,play
 
 ```
-If no arguments are given, it defaults to the latest supported rekordbox version, sends to SoundSwitch and to DJ Visuals on 127.0.0.1:9099.
+If no arguments are given, it defaults to the latest supported rekordbox version, sends to SoundSwitch only (classic mode). DJ Visuals is off unless you give `-t`.
 
 Examples:
 ```
+rkbx_os2l.exe                          Only SoundSwitch
+rkbx_os2l.exe -t 127.0.0.1             SoundSwitch + visuals on this machine
 rkbx_os2l.exe -t 192.168.1.50          SoundSwitch + visuals on a laptop on the LAN
 rkbx_os2l.exe -n -t 192.168.1.50:9100  Only the visuals, no SoundSwitch
-rkbx_os2l.exe -t off                   Only SoundSwitch
+rkbx_os2l.exe -f                       Both decks + channel faders to SoundSwitch
 ```
 
+### SoundSwitch modes
+By default rkbx_os2l runs in **classic mode**, the same as v0.0.3: only the master deck is sent to SoundSwitch, as deck 1 (track, time and beat position). This is the mode that works for most setups.
+
+With `-f` it runs in **fader mode**: both decks are sent with their channel fader levels, play state and the master BPM, so SoundSwitch can mix the lighting between decks. Some setups stop following tracks in this mode; if that happens, run without `-f`.
+
+> **Note:** Fader mode needs **"External mixer" turned off** in SoundSwitch's settings. If you mix with the channel faders (not the crossfader), also turn **"Upfader only" on**, or the lights only reach about half brightness.
+
 ### DJ Visuals
-Alongside SoundSwitch, rkbx_os2l sends what's playing to a DJ Visuals server: UDP, one JSON object per datagram. It's fire-and-forget, so a missing or slow visuals server never affects SoundSwitch or the polling loop.
+With `-t`, rkbx_os2l also sends what's playing to a DJ Visuals server: UDP, one JSON object per datagram. It's fire-and-forget, so a missing or slow visuals server never affects SoundSwitch or the polling loop.
 
 | Message | Sent when |
 | ----- | ----- |
@@ -55,7 +67,15 @@ The visuals can run on another machine: point `-t` at its LAN address (or name).
 
 
 ### Autoscript
-To have autoscript support you need to have VirtualDJ (free version) on your computer to get a proper beatgrid.
+There are two ways to make autoscripts (or manual scripts) for your tracks. VirtualDJ is no longer required.
+
+#### Using Rekordbox (no VirtualDJ needed)
+1. In SoundSwitch's settings, change "Input" to "Rekordbox", and restart SoundSwitch.
+2. Go to "Edit" mode, and create autoscripts or manual scripts for your tracks.
+3. Change "Input" back to "VirtualDJ", and restart SoundSwitch.
+
+#### Using VirtualDJ (the old way)
+You need VirtualDJ (free version) on your computer to get a proper beatgrid.
 Note: The path to the song is what SoundSwitch uses to find the scripted track, so make sure that the VirtualDJ path to the song is the same as the path to the song you use in Rekordbox.
 1. Open up VirtualDJ, and find your music in the file browser
 2. Right click folder or files and go to "Batch"->"Analyze for BPM etc". This might take a while depending on your computer
@@ -76,7 +96,7 @@ By looking at the communication between VirtualDJ and SoundSwitch i was able to 
 
 ## Limitations
 - Only supports two decks.
-- Only sends data for master deck
+- Only sends data for the master deck, unless fader mode (`-f`) is on
 - Windows only
 
 # Technical Details
